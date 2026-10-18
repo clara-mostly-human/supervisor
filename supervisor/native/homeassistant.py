@@ -205,6 +205,91 @@ async def install_core(path_core: Path, version: AwesomeVersion | str) -> None:
     _LOGGER.info("Home Assistant Core %s installed", version)
 
 
+def _site_packages(venv: Path) -> Path:
+    return next((venv / "lib").glob("python3*/site-packages"))
+
+
+def integration_requirements(
+    venv: Path, config: Path, components: list[str]
+) -> list[str]:
+    """Return the requirements of the given loaded components.
+
+    Components are Core's loaded list ("zha", "sensor.aranet"); manifests come
+    from the new install and from custom_components in the config.
+    """
+    site = _site_packages(venv)
+    domains = {part for component in components for part in component.split(".")}
+    requirements: set[str] = set()
+    for domain in domains:
+        for manifest in (
+            site / "homeassistant" / "components" / domain / "manifest.json",
+            config / "custom_components" / domain / "manifest.json",
+        ):
+            if manifest.is_file():
+                requirements.update(
+                    json.loads(manifest.read_text()).get("requirements", [])
+                )
+    return sorted(requirements)
+
+
+async def install_requirements(venv: Path, requirements: list[str]) -> CommandReturn:
+    """Install requirements into a Core venv the way Core itself does (uv)."""
+    constraints = _site_packages(venv) / "homeassistant" / "package_constraints.txt"
+    return await _run(
+        str(venv / "bin" / "python"),
+        "-m",
+        "uv",
+        "pip",
+        "install",
+        "--quiet",
+        "--index-strategy",
+        "unsafe-first-match",
+        "--constraint",
+        str(constraints),
+        *requirements,
+        env={**os.environ, "VIRTUAL_ENV": str(venv)},
+    )
+
+
+async def _freeze(venv: Path) -> dict[str, str]:
+    """Return {normalized name: freeze line} of a venv, editable installs excluded."""
+    result = await _run(str(venv / "bin" / "python"), "-m", "pip", "freeze", "--all")
+    packages = {}
+    for line in result.log:
+        line = line.strip()
+        if not line or line.startswith(("-e ", "#")) or "==" not in line:
+            continue
+        name = line.split("==", 1)[0].lower().replace("_", "-").replace(".", "-")
+        packages[name] = line
+    return packages
+
+
+async def carry_over_packages(old_venv: Path, new_venv: Path) -> CommandReturn | None:
+    """Install the packages the old install had beyond the new one's, as pinned.
+
+    Core installs integration requirements on demand (discovery, MFA, ...);
+    a new install would otherwise only get them on first use, and some are
+    needed before Core can start. They go in --no-deps at the old versions;
+    the loaded integrations' requirements are resolved afterwards.
+    """
+    old, new = await asyncio.gather(_freeze(old_venv), _freeze(new_venv))
+    missing = [line for name, line in old.items() if name not in new]
+    if not missing:
+        return None
+    _LOGGER.info("Carrying %d packages over from %s", len(missing), old_venv.name)
+    return await _run(
+        str(new_venv / "bin" / "python"),
+        "-m",
+        "uv",
+        "pip",
+        "install",
+        "--quiet",
+        "--no-deps",
+        *missing,
+        env={**os.environ, "VIRTUAL_ENV": str(new_venv)},
+    )
+
+
 class NativeHomeAssistant(JobGroup):
     """Replacement for DockerHomeAssistant on a native host."""
 
@@ -212,7 +297,8 @@ class NativeHomeAssistant(JobGroup):
         """Initialize."""
         super().__init__(coresys, "native_home_assistant", HASS_NAME)
         self._version: AwesomeVersion | None = None
-        self._rollback_version: AwesomeVersion | None = None
+        # Set by HomeAssistantCore.update while it rolls back a failed update.
+        self.rolling_back: bool = False
         self._environment: dict[str, str] = {}
         self._watch_task: asyncio.Task | None = None
         self._last_state: ContainerState | None = None
@@ -322,11 +408,9 @@ class NativeHomeAssistant(JobGroup):
         The version being rolled back to is reused as is: it was running a
         moment ago, and rebuilding it would cost time and could fail.
         """
-        reuse = await self.sys_run_in_executor(is_current, self.path_core, version)
-        if not reuse and str(version) == str(self._rollback_version):
-            reuse = await self.sys_run_in_executor(
-                is_installed, self.path_core, version
-            )
+        reuse = await self.sys_run_in_executor(
+            is_installed if self.rolling_back else is_current, self.path_core, version
+        )
         if not reuse:
             await self._install(version)
         self._version = version
@@ -335,15 +419,29 @@ class NativeHomeAssistant(JobGroup):
         self, version: AwesomeVersion, image: str | None = None, latest: bool = False
     ) -> None:
         """Install the new version while the old one runs, then stop the old one."""
-        # Remember what ran before, unless this call is the rollback to it.
-        # (AwesomeVersion raises when compared with None, so compare strings.)
-        if str(version) not in {str(self._rollback_version), str(self._version)}:
-            self._rollback_version = self._version
+        previous = self._version
         components = await self._running_components()
         await self.install(version)
+        if previous and str(previous) != str(version) and not self.rolling_back:
+            await self._carry_over(previous, version)
         if components:
             await self._install_integration_requirements(version, components)
         await self.stop()
+
+    async def _carry_over(
+        self, previous: AwesomeVersion, version: AwesomeVersion
+    ) -> None:
+        """Bring the previous install's on-demand packages into the new one."""
+        old_venv = self.path_version(previous)
+        if not await self.sys_run_in_executor(is_installed, self.path_core, previous):
+            return
+        result = await carry_over_packages(old_venv, self.path_version(version))
+        if result and result.exit_code != 0:
+            raise DockerError(
+                f"Can't carry packages over into Core {version}:\n"
+                + "".join(result.log[-30:]),
+                _LOGGER.error,
+            )
 
     async def _running_components(self) -> list[str]:
         """Return the integrations the running Core has loaded, if it runs."""
@@ -367,25 +465,9 @@ class NativeHomeAssistant(JobGroup):
         venv = self.path_version(version)
         config = self.sys_config.path_homeassistant
 
-        def _requirements() -> tuple[list[str], Path]:
-            site = next((venv / "lib").glob("python3*/site-packages"))
-            domains = {
-                part for component in components for part in component.split(".")
-            }
-            requirements: set[str] = set()
-            for domain in domains:
-                for manifest in (
-                    site / "homeassistant" / "components" / domain / "manifest.json",
-                    config / "custom_components" / domain / "manifest.json",
-                ):
-                    if manifest.is_file():
-                        requirements.update(
-                            json.loads(manifest.read_text()).get("requirements", [])
-                        )
-            constraints = site / "homeassistant" / "package_constraints.txt"
-            return sorted(requirements), constraints
-
-        requirements, constraints = await self.sys_run_in_executor(_requirements)
+        requirements = await self.sys_run_in_executor(
+            integration_requirements, venv, config, components
+        )
         if not requirements:
             return
         _LOGGER.info(
@@ -393,20 +475,7 @@ class NativeHomeAssistant(JobGroup):
             len(requirements),
             version,
         )
-        result = await _run(
-            str(venv / "bin" / "python"),
-            "-m",
-            "uv",
-            "pip",
-            "install",
-            "--quiet",
-            "--index-strategy",
-            "unsafe-first-match",
-            "--constraint",
-            str(constraints),
-            *requirements,
-            env={**os.environ, "VIRTUAL_ENV": str(venv)},
-        )
+        result = await install_requirements(venv, requirements)
         if result.exit_code != 0:
             raise DockerError(
                 f"Can't install integration requirements into Core {version}:\n"

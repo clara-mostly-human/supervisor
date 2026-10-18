@@ -525,7 +525,14 @@ class HomeAssistantCore(JobGroup):
                 _LOGGER.info(
                     "A backup of the logfile is stored in /config/home-assistant-rollback.log"
                 )
-            await _install_image(rollback_version)
+            # A native install of the previous version is reused as is.
+            if IS_MACOS:
+                self.instance.rolling_back = True  # type: ignore[attr-defined]
+            try:
+                await _install_image(rollback_version)
+            finally:
+                if IS_MACOS:
+                    self.instance.rolling_back = False  # type: ignore[attr-defined]
             await _start_update(rollback_version)
         else:
             self.sys_resolution.create_issue(
