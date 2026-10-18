@@ -25,6 +25,7 @@ from .const import (
     ENV_SUPERVISOR_NAME,
     ENV_SUPERVISOR_SHARE,
     SOCKET_DOCKER,
+    SUPERVISOR_DATA,
     LogLevel,
     UpdateChannel,
 )
@@ -364,6 +365,15 @@ def check_environment() -> None:
         _LOGGER.critical("Can't find any kind of machine/homeassistant details!")
     elif not os.environ.get(ENV_SUPERVISOR_MACHINE):
         _LOGGER.info("Use the old homeassistant repository for machine extraction")
+
+    # Tools Core uses (uv) split some paths on whitespace, so a native data
+    # folder with a space breaks installing integration requirements.
+    if IS_MACOS and any(char.isspace() for char in str(SUPERVISOR_DATA)):
+        _LOGGER.critical(
+            "The data folder %s contains whitespace, which Core does not support",
+            SUPERVISOR_DATA,
+        )
+        raise SystemExit(1)
 
     # check docker socket
     if not IS_MACOS and not SOCKET_DOCKER.is_socket():

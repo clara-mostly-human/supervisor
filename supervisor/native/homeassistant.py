@@ -22,6 +22,7 @@ import asyncio
 from collections import deque
 import hashlib
 from ipaddress import IPv4Address
+import json
 import logging
 import os
 from pathlib import Path
@@ -42,7 +43,7 @@ from ..docker.const import (
 )
 from ..docker.manager import CommandReturn
 from ..docker.monitor import DockerContainerStateEvent
-from ..exceptions import DockerError
+from ..exceptions import DockerError, HomeAssistantAPIError
 from ..homeassistant.const import LANDINGPAGE
 from ..jobs.job_group import JobGroup
 from .docker import LOCALHOST
@@ -211,6 +212,7 @@ class NativeHomeAssistant(JobGroup):
         """Initialize."""
         super().__init__(coresys, "native_home_assistant", HASS_NAME)
         self._version: AwesomeVersion | None = None
+        self._rollback_version: AwesomeVersion | None = None
         self._environment: dict[str, str] = {}
         self._watch_task: asyncio.Task | None = None
         self._last_state: ContainerState | None = None
@@ -298,7 +300,7 @@ class NativeHomeAssistant(JobGroup):
         """Install a Core version into its own virtual environment."""
         if version == LANDINGPAGE:
             raise DockerError("There is no native landing page", _LOGGER.debug)
-        if version == self._version and await self.is_running():
+        if str(version) == str(self._version) and await self.is_running():
             # Rebuilding deletes the venv first; never pull it from under Core.
             raise DockerError(
                 f"Not reinstalling Core {version} while it is running", _LOGGER.error
@@ -315,17 +317,102 @@ class NativeHomeAssistant(JobGroup):
         latest: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Install a Core version unless it is installed with current patches."""
-        if not await self.sys_run_in_executor(is_current, self.path_core, version):
+        """Install a Core version unless a usable install exists.
+
+        The version being rolled back to is reused as is: it was running a
+        moment ago, and rebuilding it would cost time and could fail.
+        """
+        reuse = await self.sys_run_in_executor(is_current, self.path_core, version)
+        if not reuse and str(version) == str(self._rollback_version):
+            reuse = await self.sys_run_in_executor(
+                is_installed, self.path_core, version
+            )
+        if not reuse:
             await self._install(version)
         self._version = version
 
     async def update(
         self, version: AwesomeVersion, image: str | None = None, latest: bool = False
     ) -> None:
-        """Install the new version, then stop the running one."""
+        """Install the new version while the old one runs, then stop the old one."""
+        # Remember what ran before, unless this call is the rollback to it.
+        # (AwesomeVersion raises when compared with None, so compare strings.)
+        if str(version) not in {str(self._rollback_version), str(self._version)}:
+            self._rollback_version = self._version
+        components = await self._running_components()
         await self.install(version)
+        if components:
+            await self._install_integration_requirements(version, components)
         await self.stop()
+
+    async def _running_components(self) -> list[str]:
+        """Return the integrations the running Core has loaded, if it runs."""
+        if not await self.is_running():
+            return []
+        try:
+            return list((await self.sys_homeassistant.api.get_config())["components"])
+        except (HomeAssistantAPIError, KeyError) as err:
+            _LOGGER.warning("Can't read Core's loaded integrations: %s", err)
+            return []
+
+    async def _install_integration_requirements(
+        self, version: AwesomeVersion, components: list[str]
+    ) -> None:
+        """Install the requirements of the loaded integrations into a new install.
+
+        Core would install them on its first start, after the old version is
+        already stopped; doing it now keeps the switchover short and lets a
+        failure abort the update while the old version still runs.
+        """
+        venv = self.path_version(version)
+        config = self.sys_config.path_homeassistant
+
+        def _requirements() -> tuple[list[str], Path]:
+            site = next((venv / "lib").glob("python3*/site-packages"))
+            domains = {
+                part for component in components for part in component.split(".")
+            }
+            requirements: set[str] = set()
+            for domain in domains:
+                for manifest in (
+                    site / "homeassistant" / "components" / domain / "manifest.json",
+                    config / "custom_components" / domain / "manifest.json",
+                ):
+                    if manifest.is_file():
+                        requirements.update(
+                            json.loads(manifest.read_text()).get("requirements", [])
+                        )
+            constraints = site / "homeassistant" / "package_constraints.txt"
+            return sorted(requirements), constraints
+
+        requirements, constraints = await self.sys_run_in_executor(_requirements)
+        if not requirements:
+            return
+        _LOGGER.info(
+            "Installing %d integration requirements into Core %s",
+            len(requirements),
+            version,
+        )
+        result = await _run(
+            str(venv / "bin" / "python"),
+            "-m",
+            "uv",
+            "pip",
+            "install",
+            "--quiet",
+            "--index-strategy",
+            "unsafe-first-match",
+            "--constraint",
+            str(constraints),
+            *requirements,
+            env={**os.environ, "VIRTUAL_ENV": str(venv)},
+        )
+        if result.exit_code != 0:
+            raise DockerError(
+                f"Can't install integration requirements into Core {version}:\n"
+                + "".join(result.log[-30:]),
+                _LOGGER.error,
+            )
 
     async def check_image(self, *args: Any, **kwargs: Any) -> None:
         """Nothing to check natively."""
