@@ -6,6 +6,7 @@ from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
 import os
 from pathlib import Path, PurePath
+import sys
 from sys import version_info as systemversion
 from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
 
@@ -29,7 +30,14 @@ DNS_DOCKER_NAME: str = f"{DOCKER_PREFIX}_dns"
 OBSERVER_DOCKER_NAME: str = f"{DOCKER_PREFIX}_observer"
 SUPERVISOR_DOCKER_NAME: str = f"{DOCKER_PREFIX}_supervisor"
 
-URL_HASSIO_APPS = "https://github.com/home-assistant/apps"
+# On macOS the built-in ("core") app repository holds the native apps, so
+# they get the official slugs (core_matter_server) Core's integrations expect.
+URL_HASSIO_APPS = os.environ.get(
+    "SUPERVISOR_CORE_APPS_REPOSITORY",
+    "https://github.com/clara-mostly-human/ha-macos-apps"
+    if sys.platform == "darwin"
+    else "https://github.com/home-assistant/apps",
+)
 URL_HASSIO_APPS_LEGACY = "https://github.com/home-assistant/addons"
 URL_HASSIO_APPARMOR = "https://version.home-assistant.io/apparmor_{channel}.txt"
 URL_HASSIO_VERSION = "https://version.home-assistant.io/{channel}.json"

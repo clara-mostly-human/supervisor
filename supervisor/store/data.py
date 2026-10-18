@@ -156,9 +156,11 @@ class StoreData(CoreSysAttributes):
             return [
                 app
                 for app in path.glob("**/config.*")
+                # Only parts inside the repository count: the data folder
+                # itself may live under a dot-directory (e.g. a native host).
                 if not [
                     part
-                    for part in app.parts
+                    for part in app.relative_to(path).parts
                     if part.startswith(".") or part == "rootfs"
                 ]
                 and app.suffix in FILE_SUFFIX_CONFIGURATION

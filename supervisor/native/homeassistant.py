@@ -675,6 +675,7 @@ class NativeHomeAssistant(JobGroup):
         if status.running:
             return ContainerState.RUNNING
         if status.loaded and status.last_exit_code not in (None, 0):
+            self._last_exit_code = status.last_exit_code
             return ContainerState.FAILED
         return ContainerState.STOPPED
 
@@ -686,10 +687,14 @@ class NativeHomeAssistant(JobGroup):
     # poll the service and fire the same events the Docker monitor fires.
 
     _expected_down: bool = False
+    _last_exit_code: int | None = None
 
     def _fire(self, state: ContainerState) -> None:
         self._last_state = state
-        status_exit = None
+        # The watchdog logs the exit code of a failure as a number.
+        status_exit = (
+            self._last_exit_code or 1 if state == ContainerState.FAILED else None
+        )
         self.sys_bus.fire_event(
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(

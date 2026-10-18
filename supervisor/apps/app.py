@@ -98,6 +98,8 @@ from ..hardware.data import Device
 from ..homeassistant.const import WSEvent
 from ..jobs.const import JobConcurrency, JobThrottle
 from ..jobs.decorator import Job
+from ..native import IS_MACOS
+from ..native.app import NativeApp
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..resolution.data import Issue
 from ..store.app import AppStore
@@ -155,7 +157,11 @@ class App(AppModel):
     def __init__(self, coresys: CoreSys, slug: str):
         """Initialize data holder."""
         super().__init__(coresys, slug)
-        self.instance: DockerApp = DockerApp(coresys, self)
+        self.instance: DockerApp = (
+            NativeApp(coresys, self)  # type: ignore[assignment]
+            if IS_MACOS
+            else DockerApp(coresys, self)
+        )
         # Last observed container state; None until first event arrives.
         self._container_state: ContainerState | None = None
         # Cached app state. Updated only via ``_update_state`` so the value

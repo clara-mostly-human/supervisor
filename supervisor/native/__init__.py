@@ -4,6 +4,7 @@ On a native host the Supervisor, Home Assistant Core and apps are processes
 managed by the host's service manager (launchd) instead of Docker containers.
 """
 
+from pathlib import Path
 import sys
 
 IS_MACOS = sys.platform == "darwin"
@@ -46,3 +47,10 @@ LINUX_ONLY_CHECKS = frozenset(
         "systemd_unit_failure",
     }
 )
+
+NATIVE_RECIPE = "native.yaml"
+
+
+def native_recipe_exists(location: str | None) -> bool:
+    """Return True if an app folder ships a native (macOS) recipe."""
+    return bool(location) and Path(location, NATIVE_RECIPE).is_file()

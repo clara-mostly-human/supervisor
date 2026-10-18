@@ -69,6 +69,7 @@ from ..host.logs import SYSTEMD_JOURNAL_GATEWAYD_LINES_MAX
 from ..mounts.const import ATTR_FILESYSTEM, ATTR_READ_ONLY
 from ..mounts.disks import validate_block_for_mount
 from ..mounts.mount import Mount, disk_mount_uuids
+from ..native import IS_MACOS, logs as native_logs
 from ..os.data_disk import Disk
 from ..utils.systemd_journal import journal_logs_reader
 from .const import (
@@ -314,6 +315,8 @@ class APIHost(CoreSysAttributes):
         default_format: LogFormatter = LogFormatter.PLAIN,
     ) -> web.StreamResponse:
         """Return systemd-journald logs."""
+        if IS_MACOS:
+            return await self._native_logs(request, identifier, follow, no_colors)
         log_formatter = default_format
         params: dict[str, Any] = {}
         if identifier:
@@ -434,6 +437,29 @@ class APIHost(CoreSysAttributes):
                     err,
                 )
         return response
+
+    async def _native_logs(
+        self,
+        request: web.Request,
+        identifier: str | list[str] | None,
+        follow: bool,
+        no_colors: bool,
+    ) -> web.StreamResponse:
+        """Serve logs from a native host's log files instead of journald."""
+        identifier = identifier or request.match_info.get(IDENTIFIER)
+        try:
+            lines = max(2, int(request.query.get("lines", DEFAULT_LINES)))
+        except ValueError:
+            lines = DEFAULT_LINES
+        async with stop_on_disconnect(request):
+            return await native_logs.stream(
+                self.coresys,
+                request,
+                identifier,
+                lines=lines,
+                follow=follow,
+                no_colors=no_colors or "no_colors" in request.query,
+            )
 
     @api_process_raw(CONTENT_TYPE_TEXT, error_type=CONTENT_TYPE_TEXT)
     async def advanced_logs(

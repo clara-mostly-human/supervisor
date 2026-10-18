@@ -70,9 +70,8 @@ class CpuArchManager(CoreSysAttributes):
         self._supported_arch = [CpuArch(a) for a in arch_data[self.sys_machine]]
         self._default_arch = self.supported[0]
 
-        # Make sure native support is in supported list. On macOS the CPU is
-        # aarch64 but Linux aarch64 apps cannot run natively, so skip it.
-        if not IS_MACOS and native_support not in self._supported_arch:
+        # Make sure native support is in supported list
+        if native_support not in self._supported_arch:
             self._supported_arch.append(native_support)
 
         self._supported_set = set(self._supported_arch)
@@ -91,7 +90,8 @@ class CpuArchManager(CoreSysAttributes):
     def detect_cpu(self) -> CpuArch:
         """Return the arch type of local CPU."""
         if IS_MACOS:
-            return CpuArch.MACOS_AARCH64
+            # Apps declare aarch64; native.yaml decides if one runs natively.
+            return CpuArch.AARCH64
         cpu = platform.machine()
         for check, value in MAP_CPU.items():
             if cpu.startswith(check):

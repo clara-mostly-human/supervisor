@@ -891,6 +891,19 @@ class AppNotSupportedArchitectureError(AppNotSupportedError, AppAPIError):
         super().__init__(logger, app=app, architectures=", ".join(architectures))
 
 
+class AppNotSupportedNativeError(AppNotSupportedError, AppAPIError):
+    """App has no native build for this (macOS) host."""
+
+    error_key = "app_not_supported_native_error"
+    message_template = "App {app} has no native macOS build"
+
+    def __init__(  # pylint: disable=useless-parent-delegation
+        self, logger: Callable[..., None] | None = None, *, app: Any
+    ) -> None:
+        """Initialize exception."""
+        super().__init__(logger, app=app)
+
+
 class AppNotSupportedMachineTypeError(AppNotSupportedError, AppAPIError):
     """App does not support system due to machine type."""
 

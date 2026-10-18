@@ -22,6 +22,7 @@ LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 _RE_STATE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
 _RE_PID = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
 _RE_EXIT = re.compile(r"^\s*last exit code = (-?\d+|\(never exited\))", re.MULTILINE)
+_RE_SIGNAL = re.compile(r"^\s*last terminating signal = ", re.MULTILINE)
 
 
 class LaunchdError(Exception):
@@ -120,6 +121,9 @@ class LaunchAgent:
         exit_code = None
         if (m := _RE_EXIT.search(text)) and m.group(1) != "(never exited)":
             exit_code = int(m.group(1))
+        # A process killed by a signal (a crash) reports the signal instead.
+        if state != "running" and not exit_code and _RE_SIGNAL.search(text):
+            exit_code = -1
         return ServiceStatus(True, state == "running", pid, exit_code)
 
     async def bootstrap(self) -> None:

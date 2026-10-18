@@ -99,6 +99,7 @@ from ..exceptions import (
     AppNotSupportedError,
     AppNotSupportedHomeAssistantVersionError,
     AppNotSupportedMachineTypeError,
+    AppNotSupportedNativeError,
     AppRepositoryFileUnsafeError,
     HassioArchNotFound,
     StoreRepositoryFileUnsafeError,
@@ -107,6 +108,7 @@ from ..host.const import LogFormatter
 from ..jobs.const import JOB_GROUP_APP
 from ..jobs.job_group import JobGroup
 from ..misc.filter import sanitize_url_credentials
+from ..native import IS_MACOS, native_recipe_exists
 from ..utils import version_is_new_enough
 from ..utils.dt import utc_from_timestamp
 from ..utils.sentry import capture_exception
@@ -892,6 +894,10 @@ class AppModel(JobGroup, ABC):
         self, config, *, logger: Callable[..., None] | None = None
     ) -> None:
         """Validate if app is available for current system."""
+        # A native (macOS) host runs only apps that ship a native recipe.
+        if IS_MACOS and not native_recipe_exists(config.get(ATTR_LOCATION)):
+            raise AppNotSupportedNativeError(logger, app=self)
+
         # Architecture
         if not self.sys_arch.is_supported(config[ATTR_ARCH]):
             raise AppNotSupportedArchitectureError(
