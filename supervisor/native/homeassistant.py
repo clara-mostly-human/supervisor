@@ -26,6 +26,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import TYPE_CHECKING, Any
@@ -59,6 +60,7 @@ ENV_RESTORE_JOB_ID = "SUPERVISOR_RESTORE_JOB_ID"
 STOP_TIMEOUT = 240
 POLL_SECONDS = 5
 LOG_TAIL_LINES = 1000
+_RE_REQ_NAME = re.compile(r"[\s\[=<>!~;@]")
 
 
 def _python() -> str:
@@ -232,9 +234,44 @@ def integration_requirements(
     return sorted(requirements)
 
 
+def _normalize(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+async def _editable(venv: Path) -> set[str]:
+    """Return the normalized names of the editable installs in a venv."""
+    result = await _run(
+        str(venv / "bin" / "python"),
+        "-m",
+        "pip",
+        "list",
+        "--editable",
+        "--format",
+        "json",
+    )
+    try:
+        return {_normalize(p["name"]) for p in json.loads("".join(result.log))}
+    except ValueError, KeyError, TypeError:
+        return set()
+
+
 async def install_requirements(venv: Path, requirements: list[str]) -> CommandReturn:
-    """Install requirements into a Core venv the way Core itself does (uv)."""
+    """Install requirements into a Core venv the way Core itself does (uv).
+
+    Each requirement is reinstalled even if present: a carried-over package
+    can overwrite another's files (old pyipp ships the module aioipp
+    provides), and the integration's own requirement must win.
+    """
     constraints = _site_packages(venv) / "homeassistant" / "package_constraints.txt"
+    # Editable installs (a development checkout, see extra-requirements.txt)
+    # stay as they are.
+    editable = await _editable(venv)
+    reinstall = [
+        arg
+        for requirement in requirements
+        if _normalize(name := _RE_REQ_NAME.split(requirement, 1)[0]) not in editable
+        for arg in ("--reinstall-package", name)
+    ]
     return await _run(
         str(venv / "bin" / "python"),
         "-m",
@@ -246,6 +283,7 @@ async def install_requirements(venv: Path, requirements: list[str]) -> CommandRe
         "unsafe-first-match",
         "--constraint",
         str(constraints),
+        *reinstall,
         *requirements,
         env={**os.environ, "VIRTUAL_ENV": str(venv)},
     )
