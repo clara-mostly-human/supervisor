@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import hashlib
 from ipaddress import IPv4Address
 import logging
 import os
@@ -103,9 +104,37 @@ def version_path(path_core: Path, version: AwesomeVersion | str) -> Path:
     return path_core / "versions" / str(version)
 
 
+def install_fingerprint(path_core: Path) -> str:
+    """Return a hash of everything besides the version that shapes an install."""
+    digest = hashlib.sha256()
+    files = [
+        path_core / "pinned-requirements.txt",
+        path_core / "extra-requirements.txt",
+        *sorted((path_core / "patches").glob("*.patch")),
+    ]
+    for file in files:
+        if file.is_file():
+            digest.update(file.name.encode())
+            digest.update(file.read_bytes())
+    return digest.hexdigest()
+
+
 def is_installed(path_core: Path, version: AwesomeVersion | str) -> bool:
-    """Return True if a Core version finished installing."""
+    """Return True if a Core version finished installing (it can run)."""
     return (version_path(path_core, version) / INSTALLED_MARKER).exists()
+
+
+def is_current(path_core: Path, version: AwesomeVersion | str) -> bool:
+    """Return True if a Core version is installed with the current patches.
+
+    An install made with other patches or requirements is rebuilt before it
+    is used for an update, instead of being reused.
+    """
+    marker = version_path(path_core, version) / INSTALLED_MARKER
+    try:
+        return marker.read_text().strip() == install_fingerprint(path_core)
+    except FileNotFoundError:
+        return False
 
 
 async def install_core(path_core: Path, version: AwesomeVersion | str) -> None:
@@ -171,7 +200,7 @@ async def install_core(path_core: Path, version: AwesomeVersion | str) -> None:
                 raise InstallError(f"Patch {patch.name} does not apply to {version}")
             _LOGGER.info("Applied %s to Core %s", patch.name, version)
 
-    (venv / INSTALLED_MARKER).touch()
+    (venv / INSTALLED_MARKER).write_text(install_fingerprint(path_core))
     _LOGGER.info("Home Assistant Core %s installed", version)
 
 
@@ -269,6 +298,11 @@ class NativeHomeAssistant(JobGroup):
         """Install a Core version into its own virtual environment."""
         if version == LANDINGPAGE:
             raise DockerError("There is no native landing page", _LOGGER.debug)
+        if version == self._version and await self.is_running():
+            # Rebuilding deletes the venv first; never pull it from under Core.
+            raise DockerError(
+                f"Not reinstalling Core {version} while it is running", _LOGGER.error
+            )
         try:
             await install_core(self.path_core, version)
         except InstallError as err:
@@ -281,8 +315,8 @@ class NativeHomeAssistant(JobGroup):
         latest: bool = False,
         **kwargs: Any,
     ) -> None:
-        """Install a Core version unless it is already installed."""
-        if not await self.sys_run_in_executor(self._installed, version):
+        """Install a Core version unless it is installed with current patches."""
+        if not await self.sys_run_in_executor(is_current, self.path_core, version):
             await self._install(version)
         self._version = version
 
