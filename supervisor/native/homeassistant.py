@@ -89,6 +89,84 @@ async def _run(
     )
 
 
+class InstallError(Exception):
+    """Installing a Core version failed."""
+
+
+INSTALLED_MARKER = ".installed"
+
+
+def version_path(path_core: Path, version: AwesomeVersion | str) -> Path:
+    """Return the virtual environment of a Core version."""
+    return path_core / "versions" / str(version)
+
+
+def is_installed(path_core: Path, version: AwesomeVersion | str) -> bool:
+    """Return True if a Core version finished installing."""
+    return (version_path(path_core, version) / INSTALLED_MARKER).exists()
+
+
+async def install_core(path_core: Path, version: AwesomeVersion | str) -> None:
+    """Install a Core version, its extra requirements and carried patches.
+
+    The venv is built in place (a venv is not relocatable) and only counts as
+    installed once the marker file is written, so a half-finished install is
+    never used and is rebuilt on the next attempt.
+    """
+    venv = version_path(path_core, version)
+    loop = asyncio.get_running_loop()
+    if venv.exists():
+        await loop.run_in_executor(None, shutil.rmtree, venv)
+
+    _LOGGER.info("Installing Home Assistant Core %s into %s", version, venv)
+    pip = str(venv / "bin" / "pip")
+    steps: list[tuple[str, ...]] = [
+        (_python(), "-m", "venv", str(venv)),
+        (pip, "install", "--upgrade", "pip"),
+        (pip, "install", f"homeassistant=={version}"),
+    ]
+    extra = path_core / "extra-requirements.txt"
+    if extra.exists():
+        steps.append((pip, "install", "-r", str(extra)))
+
+    for step in steps:
+        result = await _run(*step)
+        if result.exit_code != 0:
+            _LOGGER.error(
+                "Installing Core %s failed at %s:\n%s",
+                version,
+                " ".join(step[:4]),
+                "".join(result.log[-40:]),
+            )
+            raise InstallError(f"Can't install Home Assistant Core {version}")
+
+    patches = path_core / "patches"
+    if patches.is_dir():
+        site = next((venv / "lib").glob("python3*/site-packages"))
+        for patch in sorted(patches.glob("*.patch")):
+            result = await _run(
+                "/usr/bin/patch",
+                "-p1",
+                "--forward",
+                "--batch",
+                "-i",
+                str(patch),
+                cwd=site,
+            )
+            if result.exit_code != 0:
+                _LOGGER.error(
+                    "Patch %s does not apply to Core %s:\n%s",
+                    patch.name,
+                    version,
+                    "".join(result.log),
+                )
+                raise InstallError(f"Patch {patch.name} does not apply to {version}")
+            _LOGGER.info("Applied %s to Core %s", patch.name, version)
+
+    (venv / INSTALLED_MARKER).touch()
+    _LOGGER.info("Home Assistant Core %s installed", version)
+
+
 class NativeHomeAssistant(JobGroup):
     """Replacement for DockerHomeAssistant on a native host."""
 
@@ -110,7 +188,7 @@ class NativeHomeAssistant(JobGroup):
 
     def path_version(self, version: AwesomeVersion) -> Path:
         """Return the virtual environment of a Core version."""
-        return self.path_core / "versions" / str(version)
+        return version_path(self.path_core, version)
 
     @property
     def path_logs(self) -> Path:
@@ -177,90 +255,16 @@ class NativeHomeAssistant(JobGroup):
     # Install
 
     def _installed(self, version: AwesomeVersion) -> bool:
-        return (self.path_version(version) / "bin" / "hass").exists()
+        return is_installed(self.path_core, version)
 
     async def _install(self, version: AwesomeVersion) -> None:
         """Install a Core version into its own virtual environment."""
         if version == LANDINGPAGE:
             raise DockerError("There is no native landing page", _LOGGER.debug)
-        venv = self.path_version(version)
-        tmp = venv.with_name(f"{version}.installing")
-        if tmp.exists():
-            await self.sys_run_in_executor(shutil.rmtree, tmp)
-
-        _LOGGER.info("Installing Home Assistant Core %s into %s", version, venv)
-        steps: list[tuple[str, ...]] = [
-            (_python(), "-m", "venv", str(tmp)),
-            (str(tmp / "bin" / "pip"), "install", "--upgrade", "pip"),
-            (str(tmp / "bin" / "pip"), "install", f"homeassistant=={version}"),
-        ]
-        extra = self.path_core / "extra-requirements.txt"
-        if await self.sys_run_in_executor(extra.exists):
-            steps.append((str(tmp / "bin" / "pip"), "install", "-r", str(extra)))
-
-        for step in steps:
-            result = await _run(*step)
-            if result.exit_code != 0:
-                _LOGGER.error(
-                    "Installing Core %s failed at %s:\n%s",
-                    version,
-                    " ".join(step[:4]),
-                    "".join(result.log[-40:]),
-                )
-                raise DockerError(f"Can't install Home Assistant Core {version}")
-
-        # Built under a temporary name so a half-finished install is never
-        # mistaken for a usable one; _finalize moves it into place.
-        await self._apply_patches(tmp, version)
-        await self.sys_run_in_executor(self._finalize, tmp, venv)
-        _LOGGER.info("Home Assistant Core %s installed", version)
-
-    def _finalize(self, tmp: Path, venv: Path) -> None:
-        """Move the finished venv into place and fix its absolute paths.
-
-        A venv is not relocatable: script shebangs and pyvenv.cfg hold its path.
-        """
-        if venv.exists():
-            shutil.rmtree(venv)
-        tmp.rename(venv)
-        old, new = str(tmp), str(venv)
-        for script in (venv / "bin").iterdir():
-            if not script.is_file() or script.is_symlink():
-                continue
-            try:
-                text = script.read_text()
-            except UnicodeDecodeError:
-                continue
-            if old in text:
-                script.write_text(text.replace(old, new))
-        cfg = venv / "pyvenv.cfg"
-        cfg.write_text(cfg.read_text().replace(old, new))
-
-    async def _apply_patches(self, venv: Path, version: AwesomeVersion) -> None:
-        """Apply the carried patches to the new install's site-packages."""
-        patches = self.path_core / "patches"
-        if not await self.sys_run_in_executor(patches.is_dir):
-            return
-        site = next((venv / "lib").glob("python3*/site-packages"))
-        for patch in sorted(patches.glob("*.patch")):
-            result = await _run(
-                "/usr/bin/patch",
-                "-p1",
-                "--forward",
-                "--batch",
-                "-i",
-                str(patch),
-                cwd=site,
-            )
-            if result.exit_code != 0:
-                _LOGGER.error(
-                    "Patch %s does not apply to Core %s:\n%s",
-                    patch.name,
-                    version,
-                    "".join(result.log),
-                )
-                raise DockerError(f"Patch {patch.name} does not apply to {version}")
-            _LOGGER.info("Applied %s to Core %s", patch.name, version)
+        try:
+            await install_core(self.path_core, version)
+        except InstallError as err:
+            raise DockerError(str(err), _LOGGER.error) from err
 
     async def install(
         self,
