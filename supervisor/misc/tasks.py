@@ -17,6 +17,7 @@ from ..exceptions import (
 )
 from ..homeassistant.const import LANDINGPAGE, WSType
 from ..jobs.decorator import Job, JobCondition
+from ..native import IS_MACOS
 from ..plugins.const import PLUGIN_UPDATE_CONDITIONS
 from ..utils.dt import utcnow
 from ..utils.sentry import async_capture_exception
@@ -314,6 +315,9 @@ class Tasks(CoreSysAttributes):
 
     async def _watchdog_observer_application(self):
         """Check running state of application and rebuild if they is not response."""
+        # The observer is a container plugin; a native host has none.
+        if IS_MACOS:
+            return
         # if observer plugin is active
         if (
             self.sys_plugins.observer.in_progress
