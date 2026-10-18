@@ -16,6 +16,7 @@ from ..docker.const import ContainerState
 from ..docker.interface import DockerInterface
 from ..docker.monitor import DockerContainerStateEvent
 from ..exceptions import DockerError, PluginDisabledError, PluginError
+from ..native import IS_MACOS
 from ..utils.common import FileConfiguration
 from ..utils.sentry import async_capture_exception
 from .const import WATCHDOG_MAX_ATTEMPTS, WATCHDOG_RETRY_SECONDS
@@ -47,7 +48,13 @@ class PluginBase(ABC, FileConfiguration, CoreSysAttributes):
 
     @property
     def enabled(self) -> bool:
-        """Return True if the plugin is enabled."""
+        """Return True if the plugin is enabled.
+
+        The plugins are containers (DNS, audio, CLI, observer, mDNS
+        forwarding); a native host provides these itself.
+        """
+        if IS_MACOS:
+            return False
         return self._data.get(ATTR_ENABLED, True)
 
     @property

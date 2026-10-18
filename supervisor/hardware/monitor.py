@@ -10,6 +10,7 @@ import pyudev
 from ..const import BusEvent
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HardwareNotFound
+from ..native import IS_MACOS
 from ..resolution.const import UnhealthyReason
 from .const import HardwareAction, UdevKernelAction
 from .data import Device
@@ -29,6 +30,8 @@ class HwMonitor(CoreSysAttributes):
 
     async def load(self) -> None:
         """Start hardware monitor."""
+        if IS_MACOS:
+            return
         try:
             self.monitor = pyudev.Monitor.from_netlink(self.context, "kernel")
             self.monitor.set_receive_buffer_size(32 * 1024 * 1024)

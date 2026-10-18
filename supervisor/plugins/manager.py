@@ -6,6 +6,7 @@ from typing import Self
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HassioError
+from ..native import IS_MACOS
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..utils.sentry import async_capture_exception
 from .audio import PluginAudio
@@ -66,10 +67,15 @@ class PluginManager(CoreSysAttributes):
         """Return multicast handler."""
         return self._multicast
 
+    @property
+    def active_plugins(self) -> list[PluginBase]:
+        """Return the plugins that run on this host."""
+        return [] if IS_MACOS else self.all_plugins
+
     async def load(self) -> None:
         """Load Supervisor plugins."""
         # Sequential to avoid issue on slow IO
-        for plugin in self.all_plugins:
+        for plugin in self.active_plugins:
             try:
                 await plugin.load()
             except Exception as err:  # pylint: disable=broad-except
@@ -126,7 +132,7 @@ class PluginManager(CoreSysAttributes):
     async def repair(self) -> None:
         """Repair Supervisor plugins."""
         await asyncio.wait(
-            [self.sys_create_task(plugin.repair()) for plugin in self.all_plugins]
+            [self.sys_create_task(plugin.repair()) for plugin in self.active_plugins]
         )
 
     async def shutdown(self) -> None:
@@ -135,7 +141,7 @@ class PluginManager(CoreSysAttributes):
         await asyncio.gather(
             *(
                 self._shutdown_plugin(plugin)
-                for plugin in self.all_plugins
+                for plugin in self.active_plugins
                 if plugin.slug != "observer"
             )
         )

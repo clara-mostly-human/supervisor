@@ -38,6 +38,7 @@ from ..exceptions import (
 )
 from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
+from ..native import IS_MACOS
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..utils.json import write_json_file
 from ..utils.sentry import async_capture_exception
@@ -448,6 +449,9 @@ class PluginDns(PluginBase):
 
     async def write_hosts(self) -> None:
         """Write hosts from memory to file."""
+        # Natively there is no DNS plugin; the host resolves names.
+        if IS_MACOS:
+            return
         # Apps start and stop in parallel and each update rewrites this file,
         # serialize the writes so an older snapshot can't overwrite a newer one
         async with self._hosts_lock:

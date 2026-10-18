@@ -7,6 +7,7 @@ from typing import Any
 from ..const import ATTR_CHECKS
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import ResolutionCheckNotFound
+from ..native import IS_MACOS, LINUX_ONLY_CHECKS
 from ..utils.sentry import async_capture_exception
 from .checks.base import CheckBase
 from .validate import get_valid_modules
@@ -40,6 +41,8 @@ class ResolutionCheck(CoreSysAttributes):
         package = f"{__package__}.checks"
         checks: dict[str, CheckBase] = {}
         for module in get_valid_modules("checks"):
+            if IS_MACOS and module in LINUX_ONLY_CHECKS:
+                continue
             check_module = import_module(f"{package}.{module}")
             check = check_module.setup(self.coresys)
             checks[check.slug] = check

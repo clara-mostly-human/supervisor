@@ -16,6 +16,7 @@ from ..exceptions import (
     HostAppArmorError,
     HostAppArmorLoadProfileError,
 )
+from ..native import IS_MACOS
 from ..resolution.const import UnsupportedReason
 from ..utils.apparmor import validate_profile
 from .const import HostFeature
@@ -58,6 +59,8 @@ class AppArmorControl(CoreSysAttributes):
 
     async def load(self) -> None:
         """Load available profiles."""
+        if IS_MACOS:
+            return
 
         def find_profiles() -> set[str]:
             profiles: set[str] = set()

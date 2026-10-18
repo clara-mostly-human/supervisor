@@ -13,5 +13,6 @@
   "qemux86-64": ["amd64"],
   "qemuarm-64": ["aarch64"],
   "intel-nuc": ["amd64"],
-  "generic-x86-64": ["amd64"]
+  "generic-x86-64": ["amd64"],
+  "macos-aarch64": ["macos-aarch64"]
 }

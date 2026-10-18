@@ -5,6 +5,7 @@ import logging
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import ResolutionNotFound
+from ..native import IS_MACOS, LINUX_ONLY_EVALUATIONS
 from ..utils.sentry import async_capture_exception
 from .const import UnhealthyReason, UnsupportedReason
 from .evaluations.base import EvaluateBase
@@ -40,6 +41,8 @@ class ResolutionEvaluation(CoreSysAttributes):
         package = f"{__package__}.evaluations"
         evaluations: dict[str, EvaluateBase] = {}
         for module in get_valid_modules("evaluations"):
+            if IS_MACOS and module in LINUX_ONLY_EVALUATIONS:
+                continue
             evaluate_module = import_module(f"{package}.{module}")
             evaluation = evaluate_module.setup(self.coresys)
             evaluations[evaluation.slug] = evaluation

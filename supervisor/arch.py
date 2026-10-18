@@ -7,6 +7,7 @@ import platform
 from .const import CpuArch
 from .coresys import CoreSys, CoreSysAttributes
 from .exceptions import ConfigurationFileError, HassioArchNotFound
+from .native import IS_MACOS
 from .utils.json import read_json_file
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -69,8 +70,9 @@ class CpuArchManager(CoreSysAttributes):
         self._supported_arch = [CpuArch(a) for a in arch_data[self.sys_machine]]
         self._default_arch = self.supported[0]
 
-        # Make sure native support is in supported list
-        if native_support not in self._supported_arch:
+        # Make sure native support is in supported list. On macOS the CPU is
+        # aarch64 but Linux aarch64 apps cannot run natively, so skip it.
+        if not IS_MACOS and native_support not in self._supported_arch:
             self._supported_arch.append(native_support)
 
         self._supported_set = set(self._supported_arch)
@@ -88,6 +90,8 @@ class CpuArchManager(CoreSysAttributes):
 
     def detect_cpu(self) -> CpuArch:
         """Return the arch type of local CPU."""
+        if IS_MACOS:
+            return CpuArch.MACOS_AARCH64
         cpu = platform.machine()
         for check, value in MAP_CPU.items():
             if cpu.startswith(check):

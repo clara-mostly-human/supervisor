@@ -5,6 +5,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
 import logging
+from os import environ
 from pathlib import Path
 from typing import Any
 import weakref
@@ -1186,13 +1187,19 @@ class RestAPI(CoreSysAttributes):
     async def start(self) -> None:
         """Run RESTful API webserver."""
         await self._runner.setup()
-        self._site = web.TCPSite(self._runner, host="0.0.0.0", port=80)
+        # A native host has no private container network: listen on localhost
+        # and an unprivileged port there (SUPERVISOR_API_HOST/PORT).
+        host = environ.get("SUPERVISOR_API_HOST", "0.0.0.0")
+        port = int(environ.get("SUPERVISOR_API_PORT", "80"))
+        self._site = web.TCPSite(self._runner, host=host, port=port)
         listening: list[str] = []
 
         try:
             await self._site.start()
         except OSError as err:
-            _LOGGER.critical("Failed to create HTTP server at 0.0.0.0:80 -> %s", err)
+            _LOGGER.critical(
+                "Failed to create HTTP server at %s:%s -> %s", host, port, err
+            )
         else:
             listening.append(str(self.sys_docker.network.supervisor))
 

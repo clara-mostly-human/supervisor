@@ -8,6 +8,8 @@ import re
 import pyudev
 
 from ..coresys import CoreSys, CoreSysAttributes
+from ..native import IS_MACOS
+from ..native.hardware import boot_time as native_boot_time
 from .const import UdevSubsystem
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -65,6 +67,13 @@ class HwHelper(CoreSysAttributes):
     async def last_boot(self) -> datetime | None:
         """Return last boot time."""
         if self._last_boot:
+            return self._last_boot
+
+        if IS_MACOS:
+            if (boot := await self.sys_run_in_executor(native_boot_time)) is None:
+                _LOGGER.error("Can't read the boot time")
+                return None
+            self._last_boot = datetime.fromtimestamp(boot, UTC)
             return self._last_boot
 
         try:

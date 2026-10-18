@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from ipaddress import IPv4Network, IPv6Network
+import os
 from pathlib import Path, PurePath
 from sys import version_info as systemversion
 from typing import TYPE_CHECKING, Any, NotRequired, Self, TypedDict
@@ -33,7 +34,10 @@ URL_HASSIO_APPS_LEGACY = "https://github.com/home-assistant/addons"
 URL_HASSIO_APPARMOR = "https://version.home-assistant.io/apparmor_{channel}.txt"
 URL_HASSIO_VERSION = "https://version.home-assistant.io/{channel}.json"
 
-SUPERVISOR_DATA = Path("/data")
+# Native (non-container) hosts such as macOS relocate these through the
+# environment; containers keep the defaults.
+SUPERVISOR_DATA = Path(os.environ.get("SUPERVISOR_DATA", "/data"))
+RUN_DIR = Path(os.environ.get("SUPERVISOR_RUN_DIR", "/run"))
 
 FILE_HASSIO_ADDONS = Path(SUPERVISOR_DATA, "addons.json")
 FILE_HASSIO_APPS = Path(SUPERVISOR_DATA, "apps.json")
@@ -51,15 +55,19 @@ FILE_HASSIO_SECURITY = Path(SUPERVISOR_DATA, "security.json")
 
 FILE_SUFFIX_CONFIGURATION = [".yaml", ".yml", ".json"]
 
-MACHINE_ID = Path("/etc/machine-id")
-RUN_SUPERVISOR_STATE = Path("/run/supervisor")
+MACHINE_ID = Path(os.environ.get("SUPERVISOR_MACHINE_ID_FILE", "/etc/machine-id"))
+RUN_SUPERVISOR_STATE = RUN_DIR / "supervisor"
 # Host /run/supervisor as seen from inside the Supervisor container
-RUN_OS = Path("/run/os")
-HOST_RUN_SUPERVISOR = PurePath("/run/supervisor")
+RUN_OS = RUN_DIR / "os"
+# A native host has no container, so the host sees the same folder
+HOST_RUN_SUPERVISOR = PurePath(
+    RUN_OS if "SUPERVISOR_RUN_DIR" in os.environ else "/run/supervisor"
+)
 SOCKET_NAME_CORE = "core.sock"
 SOCKET_NAME_SUPERVISOR = "supervisor.sock"
-SOCKET_DBUS = Path("/run/dbus/system_bus_socket")
-SOCKET_DOCKER = Path("/run/docker.sock")
+SOCKET_CORE = RUN_OS / SOCKET_NAME_CORE
+SOCKET_DBUS = RUN_DIR / "dbus" / "system_bus_socket"
+SOCKET_DOCKER = RUN_DIR / "docker.sock"
 SYSTEMD_JOURNAL_PERSISTENT = Path("/var/log/journal")
 SYSTEMD_JOURNAL_VOLATILE = Path("/run/log/journal")
 
@@ -609,6 +617,7 @@ class CpuArch(StrEnum):
 
     AARCH64 = "aarch64"
     AMD64 = "amd64"
+    MACOS_AARCH64 = "macos-aarch64"
 
 
 class FeatureFlag(StrEnum):

@@ -34,6 +34,8 @@ from .exceptions import (
 from .jobs import ChildJobSyncFilter
 from .jobs.const import JobConcurrency, JobCondition
 from .jobs.decorator import Job
+from .native import IS_MACOS
+from .native.supervisor import NativeSupervisorInstance
 from .resolution.const import ContextType, IssueType
 from .utils.sentry import async_capture_exception
 
@@ -52,7 +54,11 @@ class Supervisor(CoreSysAttributes):
     def __init__(self, coresys: CoreSys):
         """Initialize hass object."""
         self.coresys: CoreSys = coresys
-        self.instance: DockerSupervisor = DockerSupervisor(coresys)
+        self.instance: DockerSupervisor = (
+            NativeSupervisorInstance(coresys)  # type: ignore[assignment]
+            if IS_MACOS
+            else DockerSupervisor(coresys)
+        )
         self._connectivity: bool = True
         self._connectivity_check: asyncio.Task[None] | None = None
         self._connectivity_rerun_forced: bool = False
@@ -103,6 +109,11 @@ class Supervisor(CoreSysAttributes):
     def need_update(self) -> bool:
         """Return True if an update is available."""
         if self.sys_dev:
+            return False
+
+        # The published Supervisor releases are container images; a native
+        # Supervisor is updated with its own installation.
+        if IS_MACOS:
             return False
 
         try:

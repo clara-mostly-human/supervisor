@@ -9,6 +9,7 @@ from dbus_fast.aio.message_bus import MessageBus
 from ..const import SOCKET_DBUS
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import DBusFatalError, DBusNotConnectedError
+from ..native import IS_MACOS
 from .agent import OSAgent
 from .hostname import Hostname
 from .interface import DBusInterface
@@ -115,6 +116,9 @@ class DBusManager(CoreSysAttributes):
 
     async def load(self) -> None:
         """Connect interfaces to D-Bus."""
+        if IS_MACOS:
+            _LOGGER.info("No D-Bus on macOS; host control uses macOS services")
+            return
         if not await self.sys_run_in_executor(SOCKET_DBUS.exists):
             _LOGGER.error(
                 "No D-Bus support on Host. Disabled any kind of host control!"

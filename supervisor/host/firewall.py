@@ -11,6 +11,7 @@ from ..coresys import CoreSys, CoreSysAttributes
 from ..dbus.const import StartUnitMode, UnitActiveState
 from ..dbus.systemd import ExecStartEntry
 from ..exceptions import DBusError
+from ..native import IS_MACOS
 from ..resolution.const import UnhealthyReason
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -138,6 +139,10 @@ class FirewallManager(CoreSysAttributes):
 
     async def apply_gateway_firewall_rules(self) -> None:
         """Apply gateway firewall rules, marking unsupported on failure."""
+        # Natively there is no Docker gateway to protect; services bind to
+        # localhost or the host's own interfaces.
+        if IS_MACOS:
+            return
         if await self._apply_gateway_firewall_rules():
             _LOGGER.info("Gateway firewall rules applied")
         else:

@@ -52,6 +52,8 @@ from ..jobs import ChildJobSyncFilter
 from ..jobs.const import JOB_GROUP_HOME_ASSISTANT_CORE, JobConcurrency, JobThrottle
 from ..jobs.decorator import Job, JobCondition
 from ..jobs.job_group import JobGroup
+from ..native import IS_MACOS
+from ..native.homeassistant import NativeHomeAssistant
 from ..resolution.const import ContextType, IssueType
 from ..utils.sentry import async_capture_exception
 from .const import (
@@ -111,7 +113,11 @@ class HomeAssistantCore(JobGroup):
     def __init__(self, coresys: CoreSys):
         """Initialize Home Assistant object."""
         super().__init__(coresys, JOB_GROUP_HOME_ASSISTANT_CORE)
-        self.instance: DockerHomeAssistant = DockerHomeAssistant(coresys)
+        self.instance: DockerHomeAssistant = (
+            NativeHomeAssistant(coresys)  # type: ignore[assignment]
+            if IS_MACOS
+            else DockerHomeAssistant(coresys)
+        )
         self._error_state: bool = False
         self._watchdog_listener: EventListener | None = None
         self._port_reserved: bool = False
@@ -161,6 +167,11 @@ class HomeAssistantCore(JobGroup):
                 and stored_version != LANDINGPAGE
                 and await self._reinstall(stored_version)
             ):
+                return
+            if IS_MACOS:
+                # No landing page natively: install the latest Core in the
+                # background, as onboarding would after the landing page.
+                self.sys_create_task(self.install())
                 return
             await self.install_landingpage()
         else:

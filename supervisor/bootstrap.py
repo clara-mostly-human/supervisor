@@ -41,6 +41,8 @@ from .jobs import JobManager
 from .misc.scheduler import Scheduler
 from .misc.tasks import Tasks
 from .mounts.manager import MountManager
+from .native import IS_MACOS
+from .native.docker import NativeDockerAPI
 from .os.manager import OSManager
 from .plugins.manager import PluginManager
 from .resolution.module import ResolutionManager
@@ -68,7 +70,10 @@ async def initialize_coresys() -> CoreSys:
         coresys.config.modify_log_level()
 
     # Initialize core objects
-    coresys.docker = await DockerAPI(coresys).post_init()
+    if IS_MACOS:
+        coresys.docker = await NativeDockerAPI(coresys).post_init()
+    else:
+        coresys.docker = await DockerAPI(coresys).post_init()
     coresys.resolution = await ResolutionManager(coresys).load_config()
     await coresys.resolution.load_modules()
     coresys.jobs = await JobManager(coresys).load_config()
@@ -361,7 +366,7 @@ def check_environment() -> None:
         _LOGGER.info("Use the old homeassistant repository for machine extraction")
 
     # check docker socket
-    if not SOCKET_DOCKER.is_socket():
+    if not IS_MACOS and not SOCKET_DOCKER.is_socket():
         _LOGGER.critical("Can't find Docker socket!")
 
 

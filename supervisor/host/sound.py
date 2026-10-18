@@ -5,9 +5,13 @@ from datetime import timedelta
 from enum import StrEnum
 import logging
 
-from pulsectl import Pulse, PulseError, PulseIndexError, PulseOperationFailed
-
 from ..coresys import CoreSys, CoreSysAttributes
+from ..native import IS_MACOS
+
+if IS_MACOS:
+    from ..native.pulse import Pulse, PulseError, PulseIndexError, PulseOperationFailed
+else:
+    from pulsectl import Pulse, PulseError, PulseIndexError, PulseOperationFailed
 from ..exceptions import PulseAudioError
 from ..jobs.const import JobConcurrency, JobThrottle
 from ..jobs.decorator import Job
@@ -242,6 +246,8 @@ class SoundControl(CoreSysAttributes):
     )
     async def update(self, reload_pulse: bool = False):
         """Update properties over dbus."""
+        if IS_MACOS:
+            return
         _LOGGER.info("Updating PulseAudio information")
 
         def _get_pulse_data() -> PulseData:

@@ -13,6 +13,7 @@ from ..exceptions import (
     HostInvalidHostnameError,
     HostNotSupportedError,
 )
+from ..native import IS_MACOS
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
@@ -124,6 +125,10 @@ class SystemControl(CoreSysAttributes):
 
     async def set_timezone(self, timezone: str) -> None:
         """Set timezone on host."""
+        # macOS owns the system time zone (System Settings); Core and the
+        # Supervisor still use the configured one.
+        if IS_MACOS:
+            return
         # /etc/localtime is not writable on OS older than 16.2
         if (
             self.coresys.os.available

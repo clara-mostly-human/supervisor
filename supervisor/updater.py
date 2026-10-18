@@ -315,8 +315,10 @@ class Updater(FileConfiguration, CoreSysAttributes):
             versions[ATTR_SUPERVISOR] = AwesomeVersion(data["supervisor"])
 
             # Update Home Assistant core version
+            # Machines without a Core image of their own (a native macOS
+            # host) follow the default Core release.
             versions[ATTR_HOMEASSISTANT] = AwesomeVersion(
-                data["homeassistant"][machine]
+                data["homeassistant"].get(machine, data["homeassistant"]["default"])
             )
 
             # Update HassOS version

@@ -13,6 +13,7 @@ from ..exceptions import (
     DBusObjectError,
     HardwareNotFound,
 )
+from ..native import IS_MACOS
 from .const import UdevSubsystem
 from .data import Device
 
@@ -302,6 +303,9 @@ class HwDisk(CoreSysAttributes):
 
     async def get_disk_life_time(self, path: str | Path) -> float | None:
         """Return life time estimate of the underlying SSD drive."""
+        if IS_MACOS:
+            # No SMART/eMMC wear data without root on macOS (yet).
+            return None
         mount_source_device_name = await self.sys_run_in_executor(
             self._get_mount_source_device_name, path
         )

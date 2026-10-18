@@ -9,6 +9,8 @@ import pyudev
 
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HardwareNotFound
+from ..native import IS_MACOS
+from ..native.hardware import list_devices as native_devices
 from .const import UdevSubsystem
 from .data import Device
 from .disk import HwDisk
@@ -63,6 +65,8 @@ class HardwareManager(CoreSysAttributes):
     @classmethod
     async def create(cls: type[HardwareManager], coresys: CoreSys) -> HardwareManager:
         """Complete initialization of a HardwareManager object within event loop."""
+        if IS_MACOS:
+            return cls(coresys, None)  # type: ignore[arg-type]
         return cls(coresys, await coresys.run_in_executor(pyudev.Context))
 
     @property
@@ -131,6 +135,8 @@ class HardwareManager(CoreSysAttributes):
 
     def check_subsystem_parents(self, device: Device, subsystem: UdevSubsystem) -> bool:
         """Return True if the device is part of the given subsystem parent."""
+        if IS_MACOS:
+            return False
         udev_device: pyudev.Device = pyudev.Devices.from_sys_path(
             self.udev, str(device.sysfs)
         )
@@ -139,6 +145,10 @@ class HardwareManager(CoreSysAttributes):
     def _import_devices(self) -> dict[str, Device]:
         """Import fresh from udev database."""
         devices: dict[str, Device] = {}
+
+        if IS_MACOS:
+            self._devices = {device.name: device for device in native_devices()}
+            return
 
         # Extract all devices
         for device in self.udev.list_devices():
