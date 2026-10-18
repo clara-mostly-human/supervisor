@@ -26,6 +26,7 @@ from .exceptions import (
     WhoamiSSLError,
 )
 from .homeassistant.core import LANDINGPAGE
+from .native import IS_MACOS
 from .resolution.const import ContextType, IssueType, SuggestionType, UnhealthyReason
 from .utils.dt import utcnow
 from .utils.sentry import async_capture_exception
@@ -266,12 +267,23 @@ class Core(CoreSysAttributes):
             # HomeAssistant is already running, only Supervisor restarted
             if await self.sys_hardware.helper.last_boot() == self.sys_config.last_boot:
                 _LOGGER.info("Detected Supervisor restart")
+                if IS_MACOS:
+                    # A container outlives a Supervisor restart; a native Core
+                    # service may have been stopped meanwhile, so start it.
+                    if (
+                        self.sys_homeassistant.boot
+                        and not await self.sys_homeassistant.core.is_running()
+                    ):
+                        await self.sys_homeassistant.core.release_port()
+                        _LOGGER.info("Start Home Assistant Core")
+                        with suppress(HomeAssistantError):
+                            await self.sys_homeassistant.core.start()
                 # Only update, rebuild and restore remove the Core container, so
                 # a missing one means the Supervisor restart interrupted one of
                 # them. An update of a deliberately stopped Core also leaves no
                 # container; starting Core in that case is accepted, since boot
                 # can be disabled to opt out.
-                if (
+                elif (
                     self.sys_homeassistant.boot
                     and not await self.sys_homeassistant.core.instance.is_initialize()
                 ):

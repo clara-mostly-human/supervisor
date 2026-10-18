@@ -5,8 +5,10 @@ Each Core version is installed into its own virtual environment under
 Installing a new version never touches the running one, so a failed update
 rolls back by starting the previous version again, like switching images.
 
-Two optional files under ``<data>/core`` shape every install:
+Optional files under ``<data>/core`` shape every install:
 
+* ``pinned-requirements.txt``: a complete pinned package set, installed
+  without dependency resolution, e.g. to clone an existing installation.
 * ``extra-requirements.txt``: packages installed next to Core, e.g. an
   editable development checkout of a library a custom integration uses.
 * ``patches/*.patch``: unified diffs applied to site-packages after install,
@@ -125,6 +127,12 @@ async def install_core(path_core: Path, version: AwesomeVersion | str) -> None:
         (pip, "install", "--upgrade", "pip"),
         (pip, "install", f"homeassistant=={version}"),
     ]
+    pinned = path_core / "pinned-requirements.txt"
+    if pinned.exists():
+        # A complete pinned set (e.g. `pip freeze` of an existing install),
+        # installed as is to reproduce that environment exactly; Core itself
+        # installs integration requirements without resolving conflicts.
+        steps.append((pip, "install", "--no-deps", "-r", str(pinned)))
     extra = path_core / "extra-requirements.txt"
     if extra.exists():
         steps.append((pip, "install", "-r", str(extra)))
