@@ -1,15 +1,21 @@
 """Run apps natively on macOS.
 
-A native app is an app repository folder with the usual ``config.yaml``
-(``arch: [macos-aarch64]``, no ``image``) and a ``native.yaml`` recipe::
+A native app is an app repository folder with the usual ``config.yaml`` (no
+``image``) and a ``native.yaml`` recipe::
 
     requirements:            # pip requirements; {version} is the app version
       - python-matter-server[server]=={version}
-    run: run.py              # script in the app folder, run with the app's Python
+    build: build.sh          # optional: script run with OUT/SRC_DIR/CACHE/VERSION
+    run: run.py              # what to start: a .py runs with the app's Python,
+                             # anything else is executed directly
+    privileged: false        # true: runs as root through the root helper
 
 Each version is installed under ``<data>/apps/native/<slug>/versions/<version>``
-(a venv plus a copy of the app folder) and runs as a per-user LaunchAgent.
-The app gets the environment a container app gets, translated to the host:
+(a copy of the app folder in ``app/``, a venv if there are requirements, build
+output in ``out/``). Unprivileged apps run as a per-user LaunchAgent;
+privileged ones are copied by the root helper into a root-owned folder and run
+as a LaunchDaemon. The app gets the environment a container app gets,
+translated to the host:
 
 * ``SUPERVISOR`` / ``SUPERVISOR_TOKEN``: the Supervisor API and the app's token
 * ``APP_DATA``: the app's data folder (``/data`` in a container), with
@@ -22,8 +28,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import suppress
+from dataclasses import dataclass
 from ipaddress import IPv4Address
+import json
 import logging
+import os
 from pathlib import Path
 import shutil
 import time
@@ -32,15 +42,15 @@ from typing import TYPE_CHECKING, Any
 from awesomeversion import AwesomeVersion
 import yaml
 
-from ..const import BusEvent
+from ..const import AppBoot, BusEvent
 from ..docker.const import ENV_TIME, ENV_TOKEN, ENV_TOKEN_OLD, ContainerState
 from ..docker.monitor import DockerContainerStateEvent
 from ..exceptions import DockerError
 from ..jobs.job_group import JobGroup
-from . import NATIVE_RECIPE as RECIPE
+from . import NATIVE_RECIPE as RECIPE, helper
 from .docker import LOCALHOST
 from .homeassistant import _launchd_prefix, _python, _run, api_address
-from .launchd import LaunchAgent, LaunchdError
+from .launchd import LaunchAgent, LaunchdError, ServiceStatus
 
 if TYPE_CHECKING:
     from ..apps.app import App
@@ -54,6 +64,127 @@ LOG_TAIL_LINES = 1000
 HOST_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 
+@dataclass(slots=True, frozen=True)
+class InstallInfo:
+    """What an installed version runs."""
+
+    run: str
+    privileged: bool
+
+    @staticmethod
+    def read(marker: Path) -> InstallInfo:
+        """Read an install marker."""
+        text = marker.read_text().strip()
+        try:
+            data = json.loads(text)
+        except ValueError:  # plain run path, written before privileged apps
+            return InstallInfo(run=text, privileged=False)
+        return InstallInfo(run=data["run"], privileged=bool(data.get("privileged")))
+
+
+class AgentService:
+    """An app run as a LaunchAgent in the user's session."""
+
+    def __init__(self, label: str) -> None:
+        """Initialize."""
+        self.agent = LaunchAgent(label)
+        self.label = label
+
+    async def status(self) -> ServiceStatus:
+        """Return the service state."""
+        return await self.agent.status()
+
+    async def define(
+        self,
+        version_path: Path,
+        info: InstallInfo,
+        environment: dict[str, str],
+        working_directory: Path,
+        log_file: Path,
+        run_at_load: bool,
+    ) -> None:
+        """Write the LaunchAgent."""
+        script = version_path / "app" / info.run
+        program = (
+            [str(version_path / "venv" / "bin" / "python"), str(script)]
+            if info.run.endswith(".py")
+            else [str(script)]
+        )
+        await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: self.agent.write_plist(
+                program,
+                environment=environment,
+                working_directory=working_directory,
+                stdout=log_file,
+                stderr=log_file,
+            ),
+        )
+
+    async def start(self) -> None:
+        """Start it."""
+        if (await self.agent.status()).loaded:
+            await self.agent.kickstart()
+        else:
+            await self.agent.bootstrap()
+
+    async def stop(self, timeout: float, remove: bool) -> None:
+        """Stop it; remove the definition if asked."""
+        await self.agent.bootout(timeout)
+        if remove:
+            await asyncio.get_running_loop().run_in_executor(
+                None, self.agent.remove_plist
+            )
+
+
+class DaemonService:
+    """An app run as root, as a LaunchDaemon managed by the root helper."""
+
+    def __init__(self, prefix: str, slug: str, version: str) -> None:
+        """Initialize."""
+        self.params = {"prefix": prefix, "slug": slug}
+        self.version = version
+        self.label = f"{prefix}.app.{slug}"
+
+    async def status(self) -> ServiceStatus:
+        """Return the service state."""
+        result = await helper.call("status", **self.params)
+        return ServiceStatus(
+            result["loaded"], result["running"], result["pid"], result["exit"]
+        )
+
+    async def define(
+        self,
+        version_path: Path,
+        info: InstallInfo,
+        environment: dict[str, str],
+        working_directory: Path,
+        log_file: Path,
+        run_at_load: bool,
+    ) -> None:
+        """Have the helper write the LaunchDaemon."""
+        await helper.call(
+            "service",
+            **self.params,
+            version=self.version,
+            program=f"app/{info.run}",
+            env=environment,
+            working_directory=str(working_directory),
+            log_file=str(log_file),
+            run_at_load=run_at_load,
+        )
+
+    async def start(self) -> None:
+        """Start it."""
+        await helper.call("start", **self.params)
+
+    async def stop(self, timeout: float, remove: bool) -> None:
+        """Stop it; remove the definition if asked."""
+        await helper.call(
+            "unservice" if remove else "stop", **self.params, timeout=timeout
+        )
+
+
 class NativeApp(JobGroup):
     """Replacement for DockerApp on a native host."""
 
@@ -61,7 +192,9 @@ class NativeApp(JobGroup):
         """Initialize."""
         self.app = app
         super().__init__(coresys, f"native_app_{app.slug}", app.slug)
-        self.agent = LaunchAgent(f"{_launchd_prefix()}.app.{app.slug}")
+        self._service: AgentService | DaemonService = AgentService(
+            f"{_launchd_prefix()}.app.{app.slug}"
+        )
         self._attached_version: AwesomeVersion | None = None
         self._watch_task: asyncio.Task | None = None
         self._last_state: ContainerState | None = None
@@ -164,19 +297,41 @@ class NativeApp(JobGroup):
         await self.sys_run_in_executor(
             lambda: shutil.copytree(source, target / "app", symlinks=True)
         )
-        venv = target / "venv"
-        pip = str(venv / "bin" / "pip")
+        info = InstallInfo(
+            run=str(recipe.get("run", "run.py")),
+            privileged=bool(recipe.get("privileged")),
+        )
         requirements = [
             str(req).format(version=version) for req in recipe.get("requirements", [])
         ]
-        steps: list[tuple[str, ...]] = [
-            (str(recipe.get("python") or _python()), "-m", "venv", str(venv)),
-            (pip, "install", "--upgrade", "pip"),
-        ]
-        if requirements:
-            steps.append((pip, "install", *requirements))
-        for step in steps:
-            result = await _run(*step)
+        steps: list[tuple[tuple[str, ...], dict[str, str] | None]] = []
+        if requirements or info.run.endswith(".py"):
+            venv = target / "venv"
+            pip = str(venv / "bin" / "pip")
+            python = str(recipe.get("python") or _python())
+            steps += [
+                ((python, "-m", "venv", str(venv)), None),
+                ((pip, "install", "--upgrade", "pip"), None),
+            ]
+            if requirements:
+                steps.append(((pip, "install", *requirements), None))
+        if build := recipe.get("build"):
+            cache = self.path_root / "cache"
+            env = {
+                **os.environ,
+                "SRC_DIR": str(target / "app"),
+                "OUT": str(target / "out"),
+                "CACHE": str(cache),
+                "VERSION": str(version),
+                "PATH": HOST_PATH,
+            }
+            await self.sys_run_in_executor(
+                lambda: cache.mkdir(parents=True, exist_ok=True)
+            )
+            steps.append((("/bin/bash", str(target / "app" / str(build))), env))
+
+        for step, env in steps:
+            result = await _run(*step, env=env)
             if result.exit_code != 0:
                 _LOGGER.error(
                     "Installing app %s %s failed:\n%s",
@@ -186,9 +341,23 @@ class NativeApp(JobGroup):
                 )
                 raise DockerError(f"Can't install app {self.app.slug} {version}")
 
-        run = str(recipe.get("run", "run.py"))
+        if info.privileged:
+            # Root runs a root-owned copy the user account cannot change.
+            try:
+                await helper.call(
+                    "install",
+                    prefix=_launchd_prefix(),
+                    slug=self.app.slug,
+                    version=str(version),
+                    source=str(target),
+                )
+            except helper.HelperError as err:
+                raise DockerError(str(err), _LOGGER.error) from err
+
         await self.sys_run_in_executor(
-            lambda: (target / INSTALLED_MARKER).write_text(run)
+            lambda: (target / INSTALLED_MARKER).write_text(
+                json.dumps({"run": info.run, "privileged": info.privileged})
+            )
         )
         _LOGGER.info("App %s %s installed", self.app.slug, version)
 
@@ -203,7 +372,7 @@ class NativeApp(JobGroup):
         """Install a version unless it is installed."""
         if not await self.sys_run_in_executor(self._installed, version):
             await self._install(version)
-        self._attached_version = version
+        await self._use_version(version)
 
     async def update(
         self, version: AwesomeVersion, image: str | None = None, **kwargs: Any
@@ -241,6 +410,11 @@ class NativeApp(JobGroup):
         """Stop and remove the service and, if asked, all installs."""
         await self.stop()
         if remove_image:
+            if isinstance(self._service, DaemonService):
+                with suppress(helper.HelperError):
+                    await helper.call(
+                        "remove", prefix=_launchd_prefix(), slug=self.app.slug
+                    )
             await self.sys_run_in_executor(
                 shutil.rmtree, self.path_root / "versions", True
             )
@@ -261,7 +435,7 @@ class NativeApp(JobGroup):
         """Attach to an installed version."""
         if not await self.sys_run_in_executor(self._installed, version):
             raise DockerError(f"App {self.app.slug} {version} is not installed")
-        self._attached_version = version
+        await self._use_version(version)
         self._start_watch()
         if not skip_state_event_if_down or await self.is_running():
             self._fire(await self.current_state())
@@ -295,37 +469,49 @@ class NativeApp(JobGroup):
                 environment[f"PORT_{port}_{(proto or 'tcp').upper()}"] = str(host_port)
         return environment
 
+    async def _use_version(self, version: AwesomeVersion) -> None:
+        """Attach a version and pick the service backend it needs."""
+        info = await self.sys_run_in_executor(
+            InstallInfo.read, self.path_version(version) / INSTALLED_MARKER
+        )
+        self._attached_version = version
+        label = f"{_launchd_prefix()}.app.{self.app.slug}"
+        self._service = (
+            DaemonService(_launchd_prefix(), self.app.slug, str(version))
+            if info.privileged
+            else AgentService(label)
+        )
+
     async def run(self, **kwargs: Any) -> None:
         """Define the service for the attached version and start it."""
         if not self._attached_version:
             raise DockerError(f"App {self.app.slug} is not installed")
         target = self.path_version(self._attached_version)
-        run = (
-            await self.sys_run_in_executor((target / INSTALLED_MARKER).read_text)
-        ).strip()
+        info = await self.sys_run_in_executor(
+            InstallInfo.read, target / INSTALLED_MARKER
+        )
         await self.stop()
-
-        def _write() -> None:
-            self.path_logs.mkdir(parents=True, exist_ok=True)
-            self.agent.write_plist(
-                [str(target / "venv" / "bin" / "python"), str(target / "app" / run)],
-                environment=self._environment(),
-                working_directory=self.app.path_data,
-                stdout=self.path_logs / "output.log",
-                stderr=self.path_logs / "output.log",
+        await self.sys_run_in_executor(
+            lambda: self.path_logs.mkdir(parents=True, exist_ok=True)
+        )
+        try:
+            await self._service.define(
+                target,
+                info,
+                self._environment(),
+                self.app.path_data,
+                self.path_logs / "output.log",
+                run_at_load=self.app.boot == AppBoot.AUTO,
             )
-
-        await self.sys_run_in_executor(_write)
+        except (helper.HelperError, LaunchdError) as err:
+            raise DockerError(f"Can't define app {self.app.slug}: {err}") from err
         await self.start()
 
     async def start(self) -> None:
         """Start the defined service."""
         try:
-            if (await self.agent.status()).loaded:
-                await self.agent.kickstart()
-            else:
-                await self.agent.bootstrap()
-        except LaunchdError as err:
+            await self._service.start()
+        except (helper.HelperError, LaunchdError) as err:
             raise DockerError(f"Can't start app {self.app.slug}: {err}") from err
         self._start_watch()
 
@@ -333,13 +519,11 @@ class NativeApp(JobGroup):
         """Stop the service; remove its definition if asked."""
         self._expected_down = True
         try:
-            await self.agent.bootout(STOP_TIMEOUT)
-        except LaunchdError as err:
+            await self._service.stop(STOP_TIMEOUT, remove_container)
+        except (helper.HelperError, LaunchdError) as err:
             raise DockerError(f"Can't stop app {self.app.slug}: {err}") from err
         finally:
             self._expected_down = False
-        if remove_container:
-            await self.sys_run_in_executor(self.agent.remove_plist)
         self._fire(ContainerState.STOPPED)
 
     async def restart(self) -> None:
@@ -349,11 +533,17 @@ class NativeApp(JobGroup):
 
     async def is_running(self) -> bool:
         """Return True if the app runs."""
-        return (await self.agent.status()).running
+        try:
+            return (await self._service.status()).running
+        except helper.HelperError:
+            return False
 
     async def current_state(self) -> ContainerState:
         """Map the launchd state to a container state."""
-        status = await self.agent.status()
+        try:
+            status = await self._service.status()
+        except helper.HelperError:
+            return ContainerState.UNKNOWN
         if status.running:
             return ContainerState.RUNNING
         if status.loaded and status.last_exit_code not in (None, 0):
@@ -374,7 +564,7 @@ class NativeApp(JobGroup):
             DockerContainerStateEvent(
                 name=self.name,
                 state=state,
-                id=self.agent.label,
+                id=self._service.label,
                 time=int(time.time()),
                 # The watchdog logs the exit code of a failure as a number.
                 exit_code=(
