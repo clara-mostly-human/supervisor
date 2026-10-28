@@ -20,6 +20,8 @@ translated to the host:
 * ``SUPERVISOR`` / ``SUPERVISOR_TOKEN``: the Supervisor API and the app's token
 * ``APP_DATA``: the app's data folder (``/data`` in a container), with
   ``options.json``; ``APP_CONFIG``, ``APP_SHARE``, ``APP_MEDIA``, ``APP_SSL``
+* ``APP_HOMEASSISTANT_CONFIG``: Home Assistant's config folder, when the app
+  maps ``homeassistant_config`` (or the legacy ``config``)
 * ``PORT_<port>_<proto>``: the host port the user picked for each port in
   ``config.yaml`` (``ports``), e.g. ``PORT_5580_TCP``
 """
@@ -42,6 +44,7 @@ from typing import TYPE_CHECKING, Any
 from awesomeversion import AwesomeVersion
 import yaml
 
+from ..apps.const import MappingType
 from ..const import AppBoot, BusEvent
 from ..docker.const import ENV_TIME, ENV_TOKEN, ENV_TOKEN_OLD, ContainerState
 from ..docker.monitor import DockerContainerStateEvent
@@ -463,6 +466,12 @@ class NativeApp(JobGroup):
             "HOME": str(Path.home()),
             "PATH": HOST_PATH,
         }
+        # A container app maps Home Assistant's config folder to /homeassistant
+        # (or /config, the legacy mapping); a native app gets its path.
+        if not self.app.map_volumes.keys().isdisjoint(
+            {MappingType.HOMEASSISTANT_CONFIG, MappingType.CONFIG}
+        ):
+            environment["APP_HOMEASSISTANT_CONFIG"] = str(config.path_homeassistant)
         for container_port, host_port in (self.app.ports or {}).items():
             if host_port:
                 port, _, proto = container_port.partition("/")
