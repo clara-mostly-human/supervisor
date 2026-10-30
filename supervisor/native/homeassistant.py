@@ -631,6 +631,7 @@ class NativeHomeAssistant(JobGroup):
 
     async def start(self) -> None:
         """Start the defined service."""
+        self.stop_requested = False
         try:
             if (await self.agent.status()).loaded:
                 await self.agent.kickstart()
@@ -687,6 +688,8 @@ class NativeHomeAssistant(JobGroup):
     # poll the service and fire the same events the Docker monitor fires.
 
     _expected_down: bool = False
+    # Someone asked for Core to stay down, so the watchdog leaves it alone.
+    stop_requested: bool = False
     _last_exit_code: int | None = None
 
     def _fire(self, state: ContainerState) -> None:

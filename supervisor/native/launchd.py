@@ -18,6 +18,7 @@ import re
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
+BOOTOUT_TIMEOUT = 30
 
 _RE_STATE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
 _RE_PID = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
@@ -154,4 +155,14 @@ class LaunchAgent:
                 _LOGGER.warning(
                     "%s did not stop within %ss, killing it", self.label, timeout
                 )
+                await _launchctl("kill", "SIGKILL", self.target, check=False)
         await _launchctl("bootout", self.target, check=False)
+        # bootout returns at once while launchd still tears the service down,
+        # and a kickstart in that window succeeds without starting anything:
+        # the service then disappears. Only return once it is really gone.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BOOTOUT_TIMEOUT
+        while (await self.status()).loaded:
+            if loop.time() >= deadline:
+                raise LaunchdError(f"{self.label} is still loaded after bootout")
+            await asyncio.sleep(0.5)

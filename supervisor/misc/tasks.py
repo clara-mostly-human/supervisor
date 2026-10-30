@@ -6,7 +6,7 @@ from typing import cast
 
 from ..apps.const import APP_UPDATE_CONDITIONS
 from ..backups.const import LOCATION_CLOUD_BACKUP, LOCATION_TYPE
-from ..const import ATTR_APP, ATTR_BACKUP, ATTR_TYPE, AppState
+from ..const import ATTR_APP, ATTR_BACKUP, ATTR_TYPE, AppState, CoreState
 from ..coresys import CoreSysAttributes
 from ..exceptions import (
     AppsError,
@@ -168,43 +168,58 @@ class Tasks(CoreSysAttributes):
         if not self.sys_homeassistant.watchdog:
             # Watchdog is not enabled for Home Assistant
             return
-        if self.sys_homeassistant.error_state:
+        # Natively nothing else brings Core back (launchd's KeepAlive is off and
+        # a failed restart leaves error_state set), so the watchdog only stands
+        # aside for a running job or a stop someone asked for, and keeps trying.
+        if self.sys_homeassistant.error_state and not IS_MACOS:
             # Home Assistant is in an error state, this is handled by the rollback feature
             return
         if self.sys_homeassistant.version == LANDINGPAGE:
             # Skip watchdog for landingpage
             return
-        if not await self.sys_homeassistant.core.is_running():
+        core = self.sys_homeassistant.core
+        down = not await core.is_running()
+        if down and (
+            not IS_MACOS
+            or core.instance.stop_requested  # type: ignore[attr-defined]
+            or self.sys_core.state != CoreState.RUNNING
+        ):
             # The home assistant container is not running
             return
-        if self.sys_homeassistant.core.in_progress:
+        if core.in_progress:
             # Home Assistant has a task in progress
             return
-        if await self.sys_homeassistant.api.check_api_state():
-            # Home Assistant is running properly
-            self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 0
-            self._cache[HASS_WATCHDOG_API_FAILURES] = 0
-            return
+        if not down:
+            if await self.sys_homeassistant.api.check_api_state():
+                # Home Assistant is running properly
+                self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 0
+                self._cache[HASS_WATCHDOG_API_FAILURES] = 0
+                return
 
-        # Init cache data
-        api_fails = self._cache.get(HASS_WATCHDOG_API_FAILURES, 0)
+            # Init cache data
+            api_fails = self._cache.get(HASS_WATCHDOG_API_FAILURES, 0)
 
-        # Look like we run into a problem
-        api_fails += 1
-        if api_fails < HASS_WATCHDOG_MAX_API_ATTEMPTS:
-            self._cache[HASS_WATCHDOG_API_FAILURES] = api_fails
-            _LOGGER.warning("Watchdog missed an Home Assistant Core API response.")
-            return
+            # Look like we run into a problem
+            api_fails += 1
+            if api_fails < HASS_WATCHDOG_MAX_API_ATTEMPTS:
+                self._cache[HASS_WATCHDOG_API_FAILURES] = api_fails
+                _LOGGER.warning("Watchdog missed an Home Assistant Core API response.")
+                return
 
         # After 5 reanimation attempts switch to safe mode. If that fails, give up
+        # (natively: keep trying normal restarts)
         reanimate_fails = self._cache.get(HASS_WATCHDOG_REANIMATE_FAILURES, 0)
-        if reanimate_fails > HASS_WATCHDOG_MAX_REANIMATE_ATTEMPTS:
+        if reanimate_fails > HASS_WATCHDOG_MAX_REANIMATE_ATTEMPTS and not IS_MACOS:
             return
 
         if safe_mode := reanimate_fails == HASS_WATCHDOG_MAX_REANIMATE_ATTEMPTS:
             _LOGGER.critical(
                 "Watchdog cannot reanimate Home Assistant Core, failed all %s attempts. Restarting into safe mode",
                 reanimate_fails,
+            )
+        elif down:
+            _LOGGER.error(
+                "Watchdog found Home Assistant Core not running. Starting it!"
             )
         else:
             _LOGGER.error(
@@ -214,9 +229,11 @@ class Tasks(CoreSysAttributes):
 
         try:
             if safe_mode:
-                await self.sys_homeassistant.core.rebuild(safe_mode=True)
+                await core.rebuild(safe_mode=True)
+            elif down:
+                await core.start()
             else:
-                await self.sys_homeassistant.core.restart()
+                await core.restart()
         except HomeAssistantError as err:
             if reanimate_fails == 0 or safe_mode:
                 await async_capture_exception(err)

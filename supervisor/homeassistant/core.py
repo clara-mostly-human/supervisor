@@ -598,6 +598,8 @@ class HomeAssistantCore(JobGroup):
     )
     async def stop(self, *, remove_container: bool = False) -> None:
         """Stop Home Assistant Docker."""
+        if IS_MACOS:
+            self.instance.stop_requested = True  # type: ignore[attr-defined]
         try:
             return await self.instance.stop(remove_container=remove_container)
         except DockerError as err:

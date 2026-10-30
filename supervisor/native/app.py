@@ -53,7 +53,7 @@ from ..jobs.job_group import JobGroup
 from . import NATIVE_RECIPE as RECIPE, helper
 from .docker import LOCALHOST
 from .homeassistant import _launchd_prefix, _python, _run, api_address
-from .launchd import LaunchAgent, LaunchdError, ServiceStatus
+from .launchd import BOOTOUT_TIMEOUT, LaunchAgent, LaunchdError, ServiceStatus
 
 if TYPE_CHECKING:
     from ..apps.app import App
@@ -186,6 +186,14 @@ class DaemonService:
         await helper.call(
             "unservice" if remove else "stop", **self.params, timeout=timeout
         )
+        # The helper's bootout returns while launchd still tears the service
+        # down; see LaunchAgent.bootout.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + BOOTOUT_TIMEOUT
+        while (await self.status()).loaded:
+            if loop.time() >= deadline:
+                raise helper.HelperError(f"{self.label} is still loaded after stop")
+            await asyncio.sleep(0.5)
 
 
 class NativeApp(JobGroup):
