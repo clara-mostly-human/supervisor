@@ -565,6 +565,9 @@ class NativeHomeAssistant(JobGroup):
         if plist := await self.sys_run_in_executor(self.agent.read_plist):
             self._environment = dict(plist.get("EnvironmentVariables", {}))
         self._start_watch()
+        # With boot off, a Core that is down after a Supervisor restart stays
+        # down. Once it has run, the watchdog looks after it (see _fire).
+        self.stop_requested = not self.sys_homeassistant.boot
         if not skip_state_event_if_down or await self.is_running():
             self._fire(await self.current_state())
 
@@ -694,6 +697,8 @@ class NativeHomeAssistant(JobGroup):
 
     def _fire(self, state: ContainerState) -> None:
         self._last_state = state
+        if state == ContainerState.RUNNING:
+            self.stop_requested = False
         # The watchdog logs the exit code of a failure as a number.
         status_exit = (
             self._last_exit_code or 1 if state == ContainerState.FAILED else None

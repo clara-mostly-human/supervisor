@@ -209,6 +209,8 @@ class NativeApp(JobGroup):
         self._attached_version: AwesomeVersion | None = None
         self._watch_task: asyncio.Task | None = None
         self._last_state: ContainerState | None = None
+        # Seen running by this Supervisor, so being down now is not its normal state.
+        self.was_running = False
         self._expected_down = False
         self._last_exit_code: int | None = None
 
@@ -576,6 +578,8 @@ class NativeApp(JobGroup):
 
     def _fire(self, state: ContainerState) -> None:
         self._last_state = state
+        if state == ContainerState.RUNNING:
+            self.was_running = True
         self.sys_bus.fire_event(
             BusEvent.DOCKER_CONTAINER_STATE_CHANGE,
             DockerContainerStateEvent(

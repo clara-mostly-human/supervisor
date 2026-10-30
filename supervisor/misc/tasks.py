@@ -351,6 +351,27 @@ class Tasks(CoreSysAttributes):
     async def _watchdog_app_application(self):
         """Check running state of the application and start if they is hangs."""
         for app in self.sys_apps.installed:
+            # Natively the event driven watchdog gives up (5 failed attempts, or
+            # its rate limit in a crash loop) and no new event follows while the
+            # state stays the same, so this tick keeps trying.
+            if (
+                IS_MACOS
+                and self.sys_core.state == CoreState.RUNNING
+                and await app.native_down_unexpectedly()
+            ):
+                _LOGGER.error(
+                    "Watchdog found app %s not running. Starting it!", app.slug
+                )
+                # Don't wait for it to report started: an app in a crash loop
+                # would hold up this check for the other apps.
+                try:
+                    await app.start()
+                except AppsError as err:
+                    _LOGGER.error(
+                        "%s watchdog reanimation failed with %s", app.slug, err
+                    )
+                continue
+
             # if watchdog need looking for
             if not app.watchdog or app.state != AppState.STARTED:
                 continue

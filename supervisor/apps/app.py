@@ -1881,6 +1881,21 @@ class App(AppModel):
         # An observed container state supersedes any prior operation error.
         self._update_state(container_state=event.state)
 
+    async def native_down_unexpectedly(self) -> bool:
+        """Return True if a native app should be running but is not.
+
+        A stop unloads the service, so a service that is loaded and failed
+        crashed, also if that was before this Supervisor started. One that is
+        not loaded only counts if this Supervisor saw it running: it may have
+        been stopped on purpose before a Supervisor restart.
+        """
+        if not self.watchdog or self._manual_stop or self.in_progress:
+            return False
+        state = await self.instance.current_state()
+        if state == ContainerState.RUNNING:
+            return False
+        return state == ContainerState.FAILED or self.instance.was_running  # type: ignore[attr-defined]
+
     async def watchdog_container(self, event: DockerContainerStateEvent) -> None:
         """Process state changes in app container and restart if necessary."""
         if event.name != self.instance.name:

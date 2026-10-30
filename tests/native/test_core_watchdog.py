@@ -11,8 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from awesomeversion import AwesomeVersion
 import pytest
 
-from supervisor.const import CoreState
-from supervisor.exceptions import HomeAssistantError
+from supervisor.apps.app import App
+from supervisor.const import AppState, CoreState
+from supervisor.docker.const import ContainerState
+from supervisor.exceptions import AppsError, HomeAssistantError
 from supervisor.misc.tasks import Tasks
 from supervisor.native.launchd import LaunchAgent, LaunchdError, ServiceStatus
 
@@ -128,6 +130,77 @@ async def test_supervisor_shutdown_is_respected():
     tasks.coresys.core.state = CoreState.SHUTDOWN
     await tick(tasks)
     core.start.assert_not_called()
+
+
+def make_app(
+    state: ContainerState, *, was_running: bool = True, manual_stop: bool = False
+) -> App:
+    """Return an App with only what the down check reads."""
+    app = App.__new__(App)
+    app._manual_stop = manual_stop
+    app.instance = MagicMock(was_running=was_running)
+    app.instance.current_state = AsyncMock(return_value=state)
+    return app
+
+
+@pytest.mark.parametrize(
+    ("state", "was_running", "manual_stop", "expected"),
+    [
+        (ContainerState.RUNNING, True, False, False),
+        # Crashed: restart, also if it crashed before this Supervisor started.
+        (ContainerState.FAILED, True, False, True),
+        (ContainerState.FAILED, False, False, True),
+        # Exited 0 or unloaded by hand after running.
+        (ContainerState.STOPPED, True, False, True),
+        (ContainerState.UNKNOWN, True, False, True),
+        # Not loaded and never seen running: may be a stop from before a restart.
+        (ContainerState.UNKNOWN, False, False, False),
+        # Stopped on purpose.
+        (ContainerState.UNKNOWN, True, True, False),
+        (ContainerState.FAILED, True, True, False),
+    ],
+)
+async def test_app_down_unexpectedly(state, was_running, manual_stop, expected):
+    """Test which down states the app watchdog acts on."""
+    app = make_app(state, was_running=was_running, manual_stop=manual_stop)
+    with (
+        patch.object(App, "watchdog", True),
+        patch.object(App, "in_progress", False),
+    ):
+        assert await app.native_down_unexpectedly() is expected
+
+
+async def test_app_down_watchdog_off_or_job_running():
+    """Test the watchdog option and a running job are respected."""
+    app = make_app(ContainerState.FAILED)
+    with patch.object(App, "watchdog", False), patch.object(App, "in_progress", False):
+        assert await app.native_down_unexpectedly() is False
+    with patch.object(App, "watchdog", True), patch.object(App, "in_progress", True):
+        assert await app.native_down_unexpectedly() is False
+
+
+async def test_app_watchdog_keeps_trying():
+    """Test failed starts are retried on every tick, with no limit."""
+    tasks, _ = make_tasks()
+    app = MagicMock(slug="core_test", state=AppState.UNKNOWN, watchdog=True)
+    app.native_down_unexpectedly = AsyncMock(return_value=True)
+    app.start = AsyncMock(side_effect=AppsError())
+    tasks.coresys.apps.installed = [app]
+    for _ in range(30):
+        await tasks._watchdog_app_application()
+    assert app.start.await_count == 30
+
+
+async def test_app_watchdog_stands_aside_during_shutdown():
+    """Test no app is started while the Supervisor shuts down."""
+    tasks, _ = make_tasks()
+    tasks.coresys.core.state = CoreState.SHUTDOWN
+    app = MagicMock(slug="core_test", state=AppState.UNKNOWN, watchdog=True)
+    app.native_down_unexpectedly = AsyncMock(return_value=True)
+    app.start = AsyncMock()
+    tasks.coresys.apps.installed = [app]
+    await tasks._watchdog_app_application()
+    app.start.assert_not_called()
 
 
 async def test_bootout_raises_if_service_stays_loaded():
