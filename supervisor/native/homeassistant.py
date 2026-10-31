@@ -58,6 +58,7 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 HASS_NAME = "homeassistant"
 ENV_RESTORE_JOB_ID = "SUPERVISOR_RESTORE_JOB_ID"
 STOP_TIMEOUT = 240
+HUNG_STOP_TIMEOUT = 30
 POLL_SECONDS = 5
 LOG_TAIL_LINES = 1000
 HANG_SAMPLES_KEPT = 10
@@ -338,6 +339,9 @@ class NativeHomeAssistant(JobGroup):
         self._version: AwesomeVersion | None = None
         # Set by HomeAssistantCore.update while it rolls back a failed update.
         self.rolling_back: bool = False
+        # Set by the watchdog: a Core that stopped answering won't stop cleanly
+        # (its event loop handles SIGTERM), so don't wait the full timeout.
+        self.hung: bool = False
         self._environment: dict[str, str] = {}
         self._watch_task: asyncio.Task | None = None
         self._last_state: ContainerState | None = None
@@ -369,7 +373,7 @@ class NativeHomeAssistant(JobGroup):
     @property
     def timeout(self) -> int:
         """Return the stop timeout."""
-        return STOP_TIMEOUT
+        return HUNG_STOP_TIMEOUT if self.hung else STOP_TIMEOUT
 
     @property
     def attached(self) -> bool:

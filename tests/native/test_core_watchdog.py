@@ -16,7 +16,13 @@ from supervisor.apps.app import App
 from supervisor.const import AppState, CoreState
 from supervisor.docker.const import ContainerState
 from supervisor.exceptions import AppsError, HomeAssistantError
-from supervisor.misc.tasks import Tasks
+from supervisor.homeassistant.api import APIState
+from supervisor.misc.tasks import (
+    HASS_WATCHDOG_NEXT_ATTEMPT,
+    HASS_WATCHDOG_NOT_RUNNING_GRACE,
+    HASS_WATCHDOG_NOT_RUNNING_SINCE,
+    Tasks,
+)
 from supervisor.native.homeassistant import NativeHomeAssistant
 from supervisor.native.launchd import LaunchAgent, LaunchdError, ServiceStatus
 
@@ -29,7 +35,8 @@ def make_tasks(*, running: bool = True, api_ok: bool = True) -> tuple[Tasks, Mag
     homeassistant.watchdog = True
     homeassistant.error_state = False
     homeassistant.version = AwesomeVersion("2026.10.2")
-    homeassistant.api.check_api_state = AsyncMock(return_value=api_ok)
+    state = APIState("RUNNING", False) if api_ok else None
+    homeassistant.api.get_api_state = AsyncMock(return_value=state)
     core = homeassistant.core
     core.in_progress = False
     core.is_running = AsyncMock(return_value=running)
@@ -44,6 +51,8 @@ def make_tasks(*, running: bool = True, api_ok: bool = True) -> tuple[Tasks, Mag
 async def tick(tasks: Tasks) -> None:
     """Run the watchdog once, as the scheduler does."""
     with patch("supervisor.misc.tasks.async_capture_exception", AsyncMock()):
+        # Spacing of failed attempts has its own test.
+        tasks._cache.pop(HASS_WATCHDOG_NEXT_ATTEMPT, None)
         await tasks._watchdog_homeassistant_api()
 
 
@@ -349,3 +358,41 @@ async def test_capture_stacks_prunes_and_never_raises(tmp_path: Path):
 
     hass.agent.sample = AsyncMock(side_effect=OSError("no sample"))
     await NativeHomeAssistant.capture_stacks(hass)
+
+
+async def test_failed_attempts_stay_spaced_out():
+    """Test a Core that won't start isn't hammered at the fast check rate."""
+    tasks, core = make_tasks(running=False)
+    core.start.side_effect = HomeAssistantError()
+    await tick(tasks)
+    assert core.start.await_count == 1
+    with patch("supervisor.misc.tasks.async_capture_exception", AsyncMock()):
+        await tasks._watchdog_homeassistant_api()
+    assert core.start.await_count == 1
+    await tick(tasks)
+    assert core.start.await_count == 2
+
+
+async def test_starting_core_gets_longer():
+    """Test a Core that answers but isn't running is given time, then restarted."""
+    tasks, core = make_tasks()
+    tasks.sys_homeassistant.api.get_api_state.return_value = APIState(
+        "NOT_RUNNING", False
+    )
+    for _ in range(5):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    tasks._cache[HASS_WATCHDOG_NOT_RUNNING_SINCE] -= HASS_WATCHDOG_NOT_RUNNING_GRACE
+    await tick(tasks)
+    core.restart.assert_awaited_once()
+
+
+async def test_hung_stop_timeout_only_for_the_hung_restart():
+    """Test the watchdog's restart uses the short timeout, and only that one."""
+    tasks, core = make_tasks(api_ok=False)
+    seen = []
+    core.restart.side_effect = lambda: seen.append(core.instance.hung)
+    await tick(tasks)
+    await tick(tasks)
+    assert seen == [True]
+    assert core.instance.hung is False

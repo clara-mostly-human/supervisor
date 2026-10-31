@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta
 import logging
+import time
 from typing import cast
 
 from ..apps.const import APP_UPDATE_CONDITIONS
@@ -28,6 +29,13 @@ HASS_WATCHDOG_API_FAILURES = "HASS_WATCHDOG_API_FAILURES"
 HASS_WATCHDOG_REANIMATE_FAILURES = "HASS_WATCHDOG_REANIMATE_FAILURES"
 HASS_WATCHDOG_MAX_API_ATTEMPTS = 2
 HASS_WATCHDOG_MAX_REANIMATE_ATTEMPTS = 5
+HASS_WATCHDOG_NOT_RUNNING_SINCE = "HASS_WATCHDOG_NOT_RUNNING_SINCE"
+HASS_WATCHDOG_NEXT_ATTEMPT = "HASS_WATCHDOG_NEXT_ATTEMPT"
+# Natively nothing else watches Core, so check often. A Core that answers but
+# isn't running is starting or stopping, which it gets longer for than a Core
+# that doesn't answer at all, and failed attempts stay spaced out.
+HASS_WATCHDOG_NOT_RUNNING_GRACE = 150
+HASS_WATCHDOG_RETRY_SECONDS = 120
 
 RUN_UPDATE_APPS = 57600
 RUN_UPDATE_CLI = 43200  # 12h, staggered +2min per plugin
@@ -43,7 +51,7 @@ RUN_RELOAD_HOST = 7600
 RUN_RELOAD_UPDATER = 86400  # 24h
 RUN_RELOAD_INGRESS = 930
 
-RUN_WATCHDOG_HOMEASSISTANT_API = 120
+RUN_WATCHDOG_HOMEASSISTANT_API = 15 if IS_MACOS else 120
 
 RUN_WATCHDOG_APP_APPLICATION = 120
 RUN_WATCHDOG_OBSERVER_APPLICATION = 180
@@ -189,8 +197,30 @@ class Tasks(CoreSysAttributes):
         if core.in_progress:
             # Home Assistant has a task in progress
             return
+        if (
+            IS_MACOS
+            and self._cache.get(HASS_WATCHDOG_NEXT_ATTEMPT, 0) > time.monotonic()
+        ):
+            return
         if not down:
-            if await self.sys_homeassistant.api.check_api_state():
+            not_running_too_long = False
+            if IS_MACOS:
+                state = await self.sys_homeassistant.api.get_api_state()
+                running = state is not None and (
+                    state.core_state == "RUNNING" or state.offline_db_migration
+                )
+                if state is None or running:
+                    self._cache.pop(HASS_WATCHDOG_NOT_RUNNING_SINCE, None)
+                else:
+                    since = self._cache.setdefault(
+                        HASS_WATCHDOG_NOT_RUNNING_SINCE, time.monotonic()
+                    )
+                    if time.monotonic() - since < HASS_WATCHDOG_NOT_RUNNING_GRACE:
+                        return
+                    not_running_too_long = True
+            else:
+                running = await self.sys_homeassistant.api.check_api_state()
+            if running:
                 # Home Assistant is running properly
                 self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 0
                 self._cache[HASS_WATCHDOG_API_FAILURES] = 0
@@ -201,7 +231,7 @@ class Tasks(CoreSysAttributes):
 
             # Look like we run into a problem
             api_fails += 1
-            if api_fails < HASS_WATCHDOG_MAX_API_ATTEMPTS:
+            if api_fails < HASS_WATCHDOG_MAX_API_ATTEMPTS and not not_running_too_long:
                 self._cache[HASS_WATCHDOG_API_FAILURES] = api_fails
                 _LOGGER.warning("Watchdog missed an Home Assistant Core API response.")
                 return
@@ -229,6 +259,7 @@ class Tasks(CoreSysAttributes):
 
         if IS_MACOS and not down:
             await core.instance.capture_stacks()  # type: ignore[attr-defined]
+            core.instance.hung = True  # type: ignore[attr-defined]
 
         try:
             if safe_mode:
@@ -249,10 +280,16 @@ class Tasks(CoreSysAttributes):
                 _LOGGER.error("Home Assistant watchdog reanimation failed!")
 
             self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = reanimate_fails + 1
+            self._cache[HASS_WATCHDOG_NEXT_ATTEMPT] = (
+                time.monotonic() + HASS_WATCHDOG_RETRY_SECONDS
+            )
         else:
             self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 0
         finally:
             self._cache[HASS_WATCHDOG_API_FAILURES] = 0
+            self._cache.pop(HASS_WATCHDOG_NOT_RUNNING_SINCE, None)
+            if IS_MACOS:
+                core.instance.hung = False  # type: ignore[attr-defined]
 
     @Job(
         name="tasks_update_cli",
