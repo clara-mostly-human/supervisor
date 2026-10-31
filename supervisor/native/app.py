@@ -539,7 +539,7 @@ class NativeApp(JobGroup):
         self._expected_down = True
         try:
             await self._service.stop(STOP_TIMEOUT, remove_container)
-        except (helper.HelperError, LaunchdError) as err:
+        except (helper.HelperError, LaunchdError, OSError) as err:
             raise DockerError(f"Can't stop app {self.app.slug}: {err}") from err
         finally:
             self._expected_down = False
@@ -606,7 +606,8 @@ class NativeApp(JobGroup):
             if self._expected_down:
                 continue
             state = await self.current_state()
-            if state != self._last_state:
+            # A stop may have started during that await.
+            if state != self._last_state and not self._expected_down:
                 self._fire(state)
 
     # Logs and stats

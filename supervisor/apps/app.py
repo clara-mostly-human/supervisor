@@ -1328,6 +1328,13 @@ class App(AppModel):
         For apps with a healthcheck, that is when they become healthy or unhealthy.
         Apps without a healthcheck have state 'started' immediately.
         """
+        if IS_MACOS:
+            # A stop only ended when the state poll saw the app run, which an app
+            # that dies within seconds never shows, and the watchdogs ignored it
+            # from then on. A start means it should be running, also if this fails.
+            self._manual_stop = False
+            self.instance.was_running = True  # type: ignore[attr-defined]
+
         if await self.instance.is_running():
             _LOGGER.warning("%s is already running!", self.slug)
             if not self._wait_for_startup_task or self._wait_for_startup_task.done():
@@ -1801,6 +1808,9 @@ class App(AppModel):
         """Restart unhealthy or failed app."""
         attempts = 0
         while await self.instance.current_state() == state:
+            # Natively a start ends a stop, so a stop made meanwhile must end this.
+            if IS_MACOS and self._manual_stop:
+                break
             if not self.in_progress:
                 if state == ContainerState.FAILED:
                     _LOGGER.warning(
@@ -1820,6 +1830,8 @@ class App(AppModel):
                         if attempts == 0:
                             with suppress(DockerError):
                                 await self.instance.stop(remove_container=True)
+                        if IS_MACOS and self._manual_stop:
+                            break
 
                         await (await self.start())
                     else:
@@ -1892,7 +1904,7 @@ class App(AppModel):
         if not self.watchdog or self._manual_stop or self.in_progress:
             return False
         state = await self.instance.current_state()
-        if state == ContainerState.RUNNING:
+        if state == ContainerState.RUNNING or self._manual_stop:
             return False
         return state == ContainerState.FAILED or self.instance.was_running  # type: ignore[attr-defined]
 
@@ -1903,6 +1915,11 @@ class App(AppModel):
 
         # Skip watchdog if not enabled or manual stopped
         if not self.watchdog or self._manual_stop:
+            return
+
+        # Natively every start fires STOPPED for the service it replaces. Nothing
+        # would be restarted, but it would use up the restart rate limit.
+        if IS_MACOS and await self.instance.current_state() != event.state:
             return
 
         if event.state in [

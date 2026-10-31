@@ -33,9 +33,15 @@ HASS_WATCHDOG_NOT_RUNNING_SINCE = "HASS_WATCHDOG_NOT_RUNNING_SINCE"
 HASS_WATCHDOG_NEXT_ATTEMPT = "HASS_WATCHDOG_NEXT_ATTEMPT"
 # Natively nothing else watches Core, so check often. A Core that answers but
 # isn't running is starting or stopping, which it gets longer for than a Core
-# that doesn't answer at all, and failed attempts stay spaced out.
+# that doesn't answer at all, and failed attempts stay spaced out. After a
+# restart of a Core that didn't answer the watchdog goes back to the slower pace
+# for a while: on a starved host a restart doesn't help, and repeats would abort
+# Core over and over.
 HASS_WATCHDOG_NOT_RUNNING_GRACE = 150
 HASS_WATCHDOG_RETRY_SECONDS = 120
+HASS_WATCHDOG_LAST_HUNG_RESTART = "HASS_WATCHDOG_LAST_HUNG_RESTART"
+HASS_WATCHDOG_RECENT_HUNG_SECONDS = 900
+HASS_WATCHDOG_MAX_API_ATTEMPTS_AFTER_HUNG = 4
 
 RUN_UPDATE_APPS = 57600
 RUN_UPDATE_CLI = 43200  # 12h, staggered +2min per plugin
@@ -167,6 +173,20 @@ class Tasks(CoreSysAttributes):
                     err,
                 )
 
+    async def _prepare_native_restart(self, no_answer: bool, recent_hung: bool) -> None:
+        """Save the stacks of a Core about to be restarted and choose how it stops."""
+        instance = self.sys_homeassistant.core.instance
+        await instance.capture_stacks()  # type: ignore[attr-defined]
+        if no_answer:
+            instance.hung = not recent_hung  # type: ignore[attr-defined]
+
+    def _finish_native_restart(self, no_answer: bool) -> None:
+        """Clear the short stop and, for a Core that didn't answer, slow down."""
+        self.sys_homeassistant.core.instance.hung = False  # type: ignore[attr-defined]
+        if no_answer:
+            # From the end: a slow restart must not use up the slower pace.
+            self._cache[HASS_WATCHDOG_LAST_HUNG_RESTART] = time.monotonic()
+
     async def _watchdog_homeassistant_api(self):
         """Create scheduler task for monitoring running state of API.
 
@@ -202,16 +222,19 @@ class Tasks(CoreSysAttributes):
             and self._cache.get(HASS_WATCHDOG_NEXT_ATTEMPT, 0) > time.monotonic()
         ):
             return
+        no_answer = False
+        not_running_too_long = False
+        recent_hung = False
+        api_fails = 0
         if not down:
-            not_running_too_long = False
             if IS_MACOS:
                 state = await self.sys_homeassistant.api.get_api_state()
+                no_answer = state is None
                 running = state is not None and (
                     state.core_state == "RUNNING" or state.offline_db_migration
                 )
-                if state is None or running:
-                    self._cache.pop(HASS_WATCHDOG_NOT_RUNNING_SINCE, None)
-                else:
+                if state is not None and not running:
+                    self._cache[HASS_WATCHDOG_API_FAILURES] = 0
                     since = self._cache.setdefault(
                         HASS_WATCHDOG_NOT_RUNNING_SINCE, time.monotonic()
                     )
@@ -224,6 +247,7 @@ class Tasks(CoreSysAttributes):
                 # Home Assistant is running properly
                 self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 0
                 self._cache[HASS_WATCHDOG_API_FAILURES] = 0
+                self._cache.pop(HASS_WATCHDOG_NOT_RUNNING_SINCE, None)
                 return
 
             # Init cache data
@@ -231,7 +255,17 @@ class Tasks(CoreSysAttributes):
 
             # Look like we run into a problem
             api_fails += 1
-            if api_fails < HASS_WATCHDOG_MAX_API_ATTEMPTS and not not_running_too_long:
+            last_hung = self._cache.get(HASS_WATCHDOG_LAST_HUNG_RESTART)
+            recent_hung = (
+                last_hung is not None
+                and time.monotonic() - last_hung < HASS_WATCHDOG_RECENT_HUNG_SECONDS
+            )
+            max_attempts = (
+                HASS_WATCHDOG_MAX_API_ATTEMPTS_AFTER_HUNG
+                if recent_hung
+                else HASS_WATCHDOG_MAX_API_ATTEMPTS
+            )
+            if api_fails < max_attempts and not not_running_too_long:
                 self._cache[HASS_WATCHDOG_API_FAILURES] = api_fails
                 _LOGGER.warning("Watchdog missed an Home Assistant Core API response.")
                 return
@@ -251,15 +285,19 @@ class Tasks(CoreSysAttributes):
             _LOGGER.error(
                 "Watchdog found Home Assistant Core not running. Starting it!"
             )
+        elif not_running_too_long:
+            _LOGGER.error(
+                "Watchdog found Home Assistant Core answering but not running for %s seconds. Restarting Home Assistant Core!",
+                HASS_WATCHDOG_NOT_RUNNING_GRACE,
+            )
         else:
             _LOGGER.error(
                 "Watchdog missed %s Home Assistant Core API responses in a row. Restarting Home Assistant Core!",
-                HASS_WATCHDOG_MAX_API_ATTEMPTS,
+                api_fails,
             )
 
         if IS_MACOS and not down:
-            await core.instance.capture_stacks()  # type: ignore[attr-defined]
-            core.instance.hung = True  # type: ignore[attr-defined]
+            await self._prepare_native_restart(no_answer, recent_hung)
 
         try:
             if safe_mode:
@@ -289,7 +327,7 @@ class Tasks(CoreSysAttributes):
             self._cache[HASS_WATCHDOG_API_FAILURES] = 0
             self._cache.pop(HASS_WATCHDOG_NOT_RUNNING_SINCE, None)
             if IS_MACOS:
-                core.instance.hung = False  # type: ignore[attr-defined]
+                self._finish_native_restart(no_answer)
 
     @Job(
         name="tasks_update_cli",
@@ -394,23 +432,25 @@ class Tasks(CoreSysAttributes):
             # Natively the event driven watchdog gives up (5 failed attempts, or
             # its rate limit in a crash loop) and no new event follows while the
             # state stays the same, so this tick keeps trying.
-            if (
-                IS_MACOS
-                and self.sys_core.state == CoreState.RUNNING
-                and await app.native_down_unexpectedly()
-            ):
-                _LOGGER.error(
-                    "Watchdog found app %s not running. Starting it!", app.slug
-                )
-                # Don't wait for it to report started: an app in a crash loop
-                # would hold up this check for the other apps.
+            if IS_MACOS and self.sys_core.state == CoreState.RUNNING:
+                # Anything wrong with this app must not stop the others being checked.
                 try:
-                    await app.start()
+                    if await app.native_down_unexpectedly():
+                        _LOGGER.error(
+                            "Watchdog found app %s not running. Starting it!", app.slug
+                        )
+                        # Don't wait for it to report started: an app in a crash
+                        # loop would hold up this check for the other apps.
+                        await app.start()
+                        continue
                 except AppsError as err:
                     _LOGGER.error(
                         "%s watchdog reanimation failed with %s", app.slug, err
                     )
-                continue
+                    continue
+                except Exception:  # pylint: disable=broad-except
+                    _LOGGER.exception("%s watchdog reanimation failed", app.slug)
+                    continue
 
             # if watchdog need looking for
             if not app.watchdog or app.state != AppState.STARTED:
