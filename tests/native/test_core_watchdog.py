@@ -17,6 +17,7 @@ from supervisor.const import AppState, CoreState
 from supervisor.docker.const import ContainerState
 from supervisor.exceptions import AppsError, HomeAssistantError
 from supervisor.misc.tasks import Tasks
+from supervisor.native.homeassistant import NativeHomeAssistant
 from supervisor.native.launchd import LaunchAgent, LaunchdError, ServiceStatus
 
 
@@ -325,3 +326,26 @@ async def test_sample_failure_never_raises(tmp_path: Path):
     down = ServiceStatus(False, False, None, None)
     with patch.object(LaunchAgent, "status", AsyncMock(return_value=down)):
         assert not await agent.sample(tmp_path / "sampled")
+
+
+async def test_capture_stacks_prunes_and_never_raises(tmp_path: Path):
+    """Test old samples are pruned and a failing sample doesn't stop the restart."""
+    loop = asyncio.get_running_loop()
+    hass = MagicMock()
+    hass.path_logs = tmp_path / "logs"
+    hass.sys_run_in_executor = lambda func: loop.run_in_executor(None, func)
+
+    def make_old() -> None:
+        hass.path_logs.mkdir()
+        for number in range(12):
+            (hass.path_logs / f"hang-{number:02}.sample.txt").touch()
+
+    await loop.run_in_executor(None, make_old)
+    hass.agent.sample = AsyncMock(return_value=True)
+    await NativeHomeAssistant.capture_stacks(hass)
+    left = await loop.run_in_executor(None, lambda: list(hass.path_logs.iterdir()))
+    assert len(left) == 9
+    assert hass.agent.sample.await_args.args[0].name.startswith("hang-2")
+
+    hass.agent.sample = AsyncMock(side_effect=OSError("no sample"))
+    await NativeHomeAssistant.capture_stacks(hass)
