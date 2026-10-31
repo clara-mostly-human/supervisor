@@ -227,6 +227,9 @@ class Tasks(CoreSysAttributes):
                 HASS_WATCHDOG_MAX_API_ATTEMPTS,
             )
 
+        if IS_MACOS and not down:
+            await core.instance.capture_stacks()  # type: ignore[attr-defined]
+
         try:
             if safe_mode:
                 await core.rebuild(safe_mode=True)

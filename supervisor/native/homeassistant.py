@@ -60,6 +60,7 @@ ENV_RESTORE_JOB_ID = "SUPERVISOR_RESTORE_JOB_ID"
 STOP_TIMEOUT = 240
 POLL_SECONDS = 5
 LOG_TAIL_LINES = 1000
+HANG_SAMPLES_KEPT = 10
 _RE_REQ_NAME = re.compile(r"[\s\[=<>!~;@]")
 
 
@@ -648,13 +649,39 @@ class NativeHomeAssistant(JobGroup):
         """Stop the service; remove its definition if asked."""
         self._expected_down = True
         try:
-            await self.agent.bootout(self.timeout)
+            # A Core stuck past the timeout gets SIGABRT: Core's fault handler
+            # writes every thread's Python stack to home-assistant.log.fault.
+            await self.agent.bootout(self.timeout, abort_first=True)
         except LaunchdError as err:
             raise DockerError(f"Can't stop Home Assistant Core: {err}") from err
         finally:
             self._expected_down = False
         if remove_container:
             await self.sys_run_in_executor(self.agent.remove_plist)
+
+    async def capture_stacks(self) -> None:
+        """Save the native stacks of a Core that stopped answering.
+
+        Restarting destroys the only evidence of why it hung. Failing to
+        capture must never get in the way of that restart.
+        """
+        name = f"hang-{time.strftime('%Y%m%d-%H%M%S')}.sample.txt"
+        path = self.path_logs / name
+
+        def prune() -> None:
+            self.path_logs.mkdir(parents=True, exist_ok=True)
+            samples = sorted(self.path_logs.glob("hang-*.sample.txt"))
+            for old in samples[: -(HANG_SAMPLES_KEPT - 1)]:
+                old.unlink(missing_ok=True)
+
+        try:
+            await self.sys_run_in_executor(prune)
+            if await self.agent.sample(path):
+                _LOGGER.warning("Saved Home Assistant Core's stacks to %s", path)
+            else:
+                _LOGGER.warning("Could not sample Home Assistant Core's stacks")
+        except (OSError, LaunchdError) as err:
+            _LOGGER.warning("Could not sample Home Assistant Core's stacks: %s", err)
 
     async def restart(self) -> None:
         """Restart the service."""

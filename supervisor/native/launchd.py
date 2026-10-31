@@ -19,6 +19,9 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 LAUNCH_AGENTS = Path.home() / "Library" / "LaunchAgents"
 BOOTOUT_TIMEOUT = 30
+ABORT_TIMEOUT = 30
+SAMPLE_SECONDS = 5
+SAMPLE_TIMEOUT = 60
 
 _RE_STATE = re.compile(r"^\s*state = (\S+)", re.MULTILINE)
 _RE_PID = re.compile(r"^\s*pid = (\d+)", re.MULTILINE)
@@ -135,8 +138,43 @@ class LaunchAgent:
         """Start the loaded service if it is not running."""
         await _launchctl("kickstart", self.target)
 
-    async def bootout(self, timeout: float) -> None:
-        """Stop and unload the service, waiting up to timeout seconds."""
+    async def sample(self, path: Path) -> bool:
+        """Write the native stacks of the running service to path."""
+        status = await self.status()
+        if not status.pid:
+            return False
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/sample",
+            str(status.pid),
+            str(SAMPLE_SECONDS),
+            "-file",
+            str(path),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            return await asyncio.wait_for(proc.wait(), SAMPLE_TIMEOUT) == 0
+        except TimeoutError:
+            proc.kill()
+            await proc.wait()
+            return False
+
+    async def _wait_stopped(self, timeout: float) -> bool:
+        """Return True once the service is no longer running."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while loop.time() < deadline:
+            await asyncio.sleep(1)
+            if not (await self.status()).running:
+                return True
+        return False
+
+    async def bootout(self, timeout: float, *, abort_first: bool = False) -> None:
+        """Stop and unload the service, waiting up to timeout seconds.
+
+        With abort_first a service that ignores SIGTERM gets SIGABRT before
+        SIGKILL, so that its fault handler can record where it was stuck.
+        """
         status = await self.status()
         if not status.loaded:
             return
@@ -145,17 +183,14 @@ class LaunchAgent:
         # to shut down cleanly, so send SIGTERM ourselves and wait first.
         if status.pid:
             await _launchctl("kill", "SIGTERM", self.target, check=False)
-            loop = asyncio.get_running_loop()
-            deadline = loop.time() + timeout
-            while loop.time() < deadline:
-                await asyncio.sleep(1)
-                if not (await self.status()).running:
-                    break
-            else:
+            if not await self._wait_stopped(timeout):
                 _LOGGER.warning(
                     "%s did not stop within %ss, killing it", self.label, timeout
                 )
-                await _launchctl("kill", "SIGKILL", self.target, check=False)
+                if abort_first:
+                    await _launchctl("kill", "SIGABRT", self.target, check=False)
+                if not abort_first or not await self._wait_stopped(ABORT_TIMEOUT):
+                    await _launchctl("kill", "SIGKILL", self.target, check=False)
         await _launchctl("bootout", self.target, check=False)
         # bootout returns at once while launchd still tears the service down,
         # and a kickstart in that window succeeds without starting anything:

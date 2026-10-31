@@ -4,6 +4,7 @@ These run without the coresys fixture, which needs a D-Bus daemon.
 """
 
 import asyncio
+import os
 from pathlib import Path
 import sys
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,6 +33,7 @@ def make_tasks(*, running: bool = True, api_ok: bool = True) -> tuple[Tasks, Mag
     core.in_progress = False
     core.is_running = AsyncMock(return_value=running)
     core.instance.stop_requested = False
+    core.instance.capture_stacks = AsyncMock()
     core.start = AsyncMock()
     core.restart = AsyncMock()
     core.rebuild = AsyncMock()
@@ -106,6 +108,22 @@ async def test_hung_core_restarted_after_two_misses():
     await tick(tasks)
     await tick(tasks)
     assert core.restart.await_count == 2
+
+
+async def test_hung_core_stacks_captured_before_restart():
+    """Test the stacks are saved first, and only for a Core that hung."""
+    tasks, core = make_tasks(api_ok=False)
+    order = MagicMock()
+    order.attach_mock(core.instance.capture_stacks, "capture")
+    order.attach_mock(core.restart, "restart")
+    await tick(tasks)
+    core.instance.capture_stacks.assert_not_called()
+    await tick(tasks)
+    assert [c[0] for c in order.mock_calls] == ["capture", "restart"]
+
+    tasks, core = make_tasks(running=False)
+    await tick(tasks)
+    core.instance.capture_stacks.assert_not_called()
 
 
 async def test_requested_stop_is_respected():
@@ -255,3 +273,55 @@ async def test_restart_of_a_hung_service_really_restarts(tmp_path: Path):
     finally:
         await agent.bootout(1)
         await loop.run_in_executor(None, agent.remove_plist)
+
+
+# Aborting a process pops up macOS's crash dialog, so this runs only when asked.
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not os.environ.get("HA_TEST_REAL_ABORT"),
+    reason="needs launchd and HA_TEST_REAL_ABORT",
+)
+async def test_stuck_service_leaves_its_stacks_behind(tmp_path: Path):
+    """Test against real launchd: sample, then SIGABRT reaches the fault handler."""
+    loop = asyncio.get_running_loop()
+    fault = tmp_path / "fault"
+    sampled = tmp_path / "sampled"
+    script = tmp_path / "stub.py"
+    await loop.run_in_executor(
+        None,
+        script.write_text,
+        "import faulthandler, signal, time\n"
+        f"faulthandler.enable(open({str(fault)!r}, 'a'))\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "def stuck_here():\n    time.sleep(100000)\n"
+        "stuck_here()\n",
+    )
+    agent = LaunchAgent(f"ha-macos-test.{tmp_path.name.lower()}")
+    await loop.run_in_executor(
+        None,
+        lambda: agent.write_plist(
+            ["/usr/bin/python3", str(script)],
+            environment={},
+            working_directory=tmp_path,
+            stdout=tmp_path / "out",
+            stderr=tmp_path / "out",
+        ),
+    )
+    try:
+        await agent.bootstrap()
+        await asyncio.sleep(2)
+        assert await agent.sample(sampled)
+        assert "Thread_" in await loop.run_in_executor(None, sampled.read_text)
+        await agent.bootout(1, abort_first=True)
+        assert not (await agent.status()).loaded
+        assert "stuck_here" in await loop.run_in_executor(None, fault.read_text)
+    finally:
+        await agent.bootout(1)
+        await loop.run_in_executor(None, agent.remove_plist)
+
+
+async def test_sample_failure_never_raises(tmp_path: Path):
+    """Test a service without a process just reports no sample."""
+    agent = LaunchAgent("ha-macos-test.absent")
+    down = ServiceStatus(False, False, None, None)
+    with patch.object(LaunchAgent, "status", AsyncMock(return_value=down)):
+        assert not await agent.sample(tmp_path / "sampled")
