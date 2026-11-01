@@ -1,9 +1,10 @@
-"""Bring a native Core back from the safe mode the watchdog put it in.
+"""Bring a native Core back from safe mode or recovery mode.
 
 Safe mode lasts until Core next restarts, and a Core in safe mode answers like
 a healthy one, so nothing would ever end it: custom integrations stay off after
-a problem that has long gone. Core's notifications are kept in memory, so each
-one lasts only as long as the Core it was sent to.
+a problem that has long gone. Recovery mode, which Core enters by itself, answers
+the same way with almost nothing loaded. Core's notifications are kept in memory,
+so each one lasts only as long as the Core it was sent to.
 
 Each step is saved before it is taken: Core outlives a Supervisor restart, and
 it can come up long after the watchdog stopped waiting for it. Core's pid and
@@ -31,13 +32,14 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 FIRST_WAIT = 30 * 60
 MAX_WAIT = 24 * 60 * 60
+RECOVERY_WAIT = 15 * 60
 STATE_FILE = "watchdog-safe-mode.json"
 NOTIFICATION_ID = "supervisor_watchdog_safe_mode"
-NOTIFICATION_TITLE = "Home Assistant Core safe mode"
+NOTIFICATION_TITLE = "Home Assistant Core watchdog"
 
 
 class Phase(StrEnum):
-    """Where the watchdog is with Core's safe mode."""
+    """Where the watchdog is with Core's safe mode or recovery mode."""
 
     ENTERING = "entering"
     IN_SAFE_MODE = "in_safe_mode"
@@ -57,22 +59,28 @@ class _Run:
 
     phase: Phase
     pid: int | None  # ENTERING: the Core before it. Otherwise the safe mode Core.
-    since: float | None  # When it first reached safe mode.
+    since: float | None  # When it first stopped running normally.
     retry_at: float
-    wait: int
+    wait: int  # Before a return from safe mode. 0: the next one is the first.
+    recovery: bool = False  # In recovery mode, whether or not in safe mode too.
 
 
 def _when(timestamp: float) -> str:
     return time.strftime("%a %H:%M", time.localtime(timestamp))
 
 
+def _longer(wait: int) -> int:
+    return min(max(wait * 2, FIRST_WAIT), MAX_WAIT)
+
+
 class NativeSafeMode(CoreSysAttributes):
-    """The safe mode run the watchdog started, if any."""
+    """The run the watchdog is looking after, if any."""
 
     def __init__(self, coresys: CoreSys) -> None:
         """Initialize."""
         self.coresys: CoreSys = coresys
         self._run: _Run | None = None
+        self._seen_pid: int | None = None
 
     @property
     def _path(self) -> Path:
@@ -88,6 +96,16 @@ class NativeSafeMode(CoreSysAttributes):
         """Return True if a normal start is under way: if Core is not up, it failed."""
         return self._run is not None and self._run.phase == Phase.RETURNING
 
+    @property
+    def in_recovery(self) -> bool:
+        """Return True if the run's Core is in recovery mode: little to lose."""
+        return self._run is not None and self._run.recovery
+
+    @property
+    def waiting(self) -> bool:
+        """Return True if a safe start has settled, with Core up and known."""
+        return self._run is not None and self._run.phase == Phase.IN_SAFE_MODE
+
     async def load(self) -> None:
         """Pick up a run from before a Supervisor restart."""
         if not await self.sys_run_in_executor(self._path.exists):
@@ -100,6 +118,7 @@ class NativeSafeMode(CoreSysAttributes):
                 since=state["since"],
                 retry_at=float(state["retry_at"]),
                 wait=int(state["wait"]),
+                recovery=bool(state.get("recovery", False)),
             )
         except (JsonFileError, KeyError, TypeError, ValueError) as err:
             _LOGGER.error("Dropping unreadable %s: %s", self._path, err)
@@ -113,9 +132,14 @@ class NativeSafeMode(CoreSysAttributes):
         elif run.phase == Phase.ENTERING:
             wait = run.wait
         else:
-            wait = min(run.wait * 2, MAX_WAIT)
+            wait = _longer(run.wait)
         self._run = _Run(
-            Phase.ENTERING, await self._pid(), run.since if run else None, 0, wait
+            Phase.ENTERING,
+            await self._pid(),
+            run.since if run else None,
+            0,
+            wait,
+            run.recovery if run else False,
         )
         await self._save()
 
@@ -126,6 +150,25 @@ class NativeSafeMode(CoreSysAttributes):
             await self.sys_run_in_executor(marker.unlink, True)
         except OSError as err:
             _LOGGER.error("Can't remove the safe mode marker: %s", err)
+
+    async def notice_recovery(self) -> None:
+        """Start a run if Core came up in recovery mode, asking once per process."""
+        pid = await self._pid()
+        if pid is None or pid == self._seen_pid:
+            return
+        try:
+            config = await self.sys_homeassistant.api.get_config()
+        except HomeAssistantAPIError as err:
+            _LOGGER.debug("Can't ask Core about recovery mode, trying later: %s", err)
+            return
+        # A Core migrating its database looks healthy, and can still fall into it.
+        if config.get("state") != "RUNNING":
+            return
+        self._seen_pid = pid
+        if config.get("recovery_mode"):
+            _LOGGER.error("Home Assistant Core is in recovery mode")
+            self._run = _Run(Phase.IN_SAFE_MODE, pid, time.time(), 0, 0, True)
+            await self._save()
 
     async def check(self) -> Action | None:
         """Compare the run with the Core that is answering, on each healthy check."""
@@ -145,30 +188,36 @@ class NativeSafeMode(CoreSysAttributes):
         except HomeAssistantAPIError as err:
             _LOGGER.debug("Can't ask Core about safe mode, trying later: %s", err)
             return None
+        # A Core migrating its database looks healthy, and hasn't reached a mode.
+        if config.get("state") != "RUNNING":
+            return None
         safe_mode = bool(config.get("safe_mode"))
         recovery_mode = bool(config.get("recovery_mode"))
+        run.recovery = recovery_mode
 
         if run.phase == Phase.ENTERING:
             if pid == run.pid:
                 # A stop that failed: this Core never read the marker.
                 await self.remove_marker()
-            if safe_mode:
+            if safe_mode or (recovery_mode and pid != run.pid):
+                # In recovery with no safe mode: the safe start crashed, and this
+                # is a later normal start. Waits, or this would be a restart loop.
                 await self._reached_safe_mode(pid, recovery_mode)
-            elif recovery_mode and run.since is not None:
-                # The way back from recovery mode failed; it isn't over.
+            elif recovery_mode:
+                # The safe start never began.
                 return Action.BACK_TO_SAFE_MODE
             else:
                 _LOGGER.error("Home Assistant Core did not go into safe mode")
                 await self.remove_marker()
-                await self._ended(recovery_mode)
+                await self._ended()
             return None
 
         if pid == run.pid:
-            if safe_mode:
+            if safe_mode or recovery_mode:
                 # Due, or a return that never got as far as restarting Core.
                 run.phase = Phase.IN_SAFE_MODE
                 return Action.NORMAL_START
-            await self._ended(recovery_mode)
+            await self._ended()
             return None
 
         if run.phase == Phase.RETURNING:
@@ -176,17 +225,19 @@ class NativeSafeMode(CoreSysAttributes):
                 return Action.BACK_TO_SAFE_MODE
             if safe_mode:
                 # A marker left behind by something else.
-                run.wait = min(run.wait * 2, MAX_WAIT)
+                run.wait = _longer(run.wait)
                 await self._reached_safe_mode(pid, recovery_mode)
             else:
-                await self._ended(recovery_mode)
+                await self._ended()
             return None
 
-        if safe_mode:
+        if recovery_mode:
+            await self._reached_safe_mode(pid, recovery_mode)
+        elif safe_mode:
             _LOGGER.info("Core was restarted into safe mode by someone else")
             await self._clear()
         else:
-            await self._ended(recovery_mode)
+            await self._ended()
         return None
 
     async def same_core(self) -> bool:
@@ -212,23 +263,31 @@ class NativeSafeMode(CoreSysAttributes):
         if not await self.same_core():
             # Core went down. The next attempt goes back into safe mode.
             return
-        self._run.wait = min(self._run.wait * 2, MAX_WAIT)
-        await self.postpone(
-            "Home Assistant Core stayed in safe mode, because it could not be "
-            "restarted.",
-            self._run.wait,
-        )
+        if not self._run.recovery:
+            self._run.wait = _longer(self._run.wait)
+        await self.postpone("it could not be restarted", self._run.wait)
 
-    async def postpone(self, reason: str, wait: int = FIRST_WAIT) -> None:
-        """Stay in safe mode for now, and say why."""
+    async def postpone(self, because: str, wait: int = FIRST_WAIT) -> None:
+        """Stay where Core is for now, and say why."""
         assert self._run
-        self._run.phase = Phase.IN_SAFE_MODE
-        self._run.retry_at = time.time() + wait
+        run = self._run
+        run.phase = Phase.IN_SAFE_MODE
+        run.retry_at = time.time() + (RECOVERY_WAIT if run.recovery else wait)
         await self._save()
+        if run.recovery:
+            stayed = (
+                "recovery mode",
+                "Almost nothing is loaded, including Matter and the locks,",
+            )
+        else:
+            stayed = (
+                "safe mode",
+                "Custom integrations and custom frontend pieces are off",
+            )
         await self._notify(
-            f"{reason} Custom integrations and custom frontend pieces are off until "
-            f"it restarts normally. A normal start will be tried at "
-            f"{_when(self._run.retry_at)}."
+            f"Home Assistant Core is staying in {stayed[0]}, because {because}. "
+            f"{stayed[1]} until it restarts normally. The next try is at "
+            f"{_when(run.retry_at)}."
         )
 
     async def _reached_safe_mode(self, pid: int, recovery_mode: bool) -> None:
@@ -239,7 +298,13 @@ class NativeSafeMode(CoreSysAttributes):
         run.phase = Phase.IN_SAFE_MODE
         run.pid = pid
         run.since = run.since or now
-        run.retry_at = now + run.wait
+        run.recovery = recovery_mode
+        if recovery_mode:
+            # Doubling protects a mostly working house. There isn't one here.
+            run.wait = 0
+            run.retry_at = now + RECOVERY_WAIT
+        else:
+            run.retry_at = now + run.wait
         await self._save()
 
         cause = (
@@ -247,36 +312,36 @@ class NativeSafeMode(CoreSysAttributes):
             if again
             else "Normal starts failed several times in a row."
         )
-        state = (
-            "is in recovery mode, so almost nothing is loaded, including Matter and "
-            "the locks"
-            if recovery_mode
-            else "is running in safe mode, with custom integrations and custom "
-            "frontend pieces off"
-        )
+        if recovery_mode:
+            state = (
+                "is in recovery mode, so almost nothing is loaded, including Matter "
+                "and the locks"
+            )
+            stop = "To stop these restarts, turn off Core's watchdog."
+        else:
+            state = (
+                "is running in safe mode, with custom integrations and custom "
+                "frontend pieces off"
+            )
+            stop = (
+                "To stay in safe mode for longer, restart Core into safe mode yourself."
+            )
         await self._notify(
             f"Home Assistant Core {state}. {cause} A normal start will be tried at "
             f"{_when(run.retry_at)}. The Supervisor and Core logs may show why it "
-            "failed. To stay in safe mode for longer, restart Core into safe mode "
-            "yourself."
+            f"failed. {stop}"
         )
 
-    async def _ended(self, recovery_mode: bool) -> None:
-        """Forget the run, and say where Core is if the user was told about it."""
+    async def _ended(self) -> None:
+        """Forget the run, and say so if there was anything to say."""
         assert self._run
         since = self._run.since
         await self._clear()
-        if recovery_mode:
-            await self._notify(
-                "Home Assistant Core is in recovery mode, so almost nothing is "
-                "loaded, including Matter and the locks. The watchdog will not "
-                "restart it. Check its configuration and log, then restart it."
-            )
-        elif since is not None:
+        if since is not None:
             await self._notify(
                 "Home Assistant Core is running normally again, with custom "
-                f"integrations back on. It had been in safe mode since {_when(since)} "
-                "because normal starts kept failing."
+                f"integrations back on. It had not been running normally since "
+                f"{_when(since)}."
             )
 
     async def _pid(self) -> int | None:

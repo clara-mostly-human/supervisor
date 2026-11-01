@@ -48,6 +48,8 @@ HASS_WATCHDOG_LAST_HUNG_RESTART = "HASS_WATCHDOG_LAST_HUNG_RESTART"
 HASS_WATCHDOG_RECENT_HUNG_SECONDS = 900
 HASS_WATCHDOG_MAX_API_ATTEMPTS_AFTER_HUNG = 4
 HASS_WATCHDOG_CONFIG_CHECK_SECONDS = 120
+CONFIG_UNCHECKED = "its configuration could not be checked"
+CONFIG_INVALID = "its configuration does not pass the check, see the Supervisor log"
 
 RUN_UPDATE_APPS = 57600
 RUN_UPDATE_CLI = 43200  # 12h, staggered +2min per plugin
@@ -218,7 +220,10 @@ class Tasks(CoreSysAttributes):
             )
 
     async def _reanimate_failed(
-        self, err: HomeAssistantError, safe_mode: bool, reanimate_fails: int
+        self,
+        err: HomeAssistantError | JobException,
+        safe_mode: bool,
+        reanimate_fails: int,
     ) -> None:
         """Count a failed attempt at bringing Core back."""
         if reanimate_fails == 0 or safe_mode:
@@ -245,36 +250,60 @@ class Tasks(CoreSysAttributes):
         if IS_MACOS:
             await self._safe_mode.entering()
         await self.sys_homeassistant.core.rebuild(safe_mode=True)
-        if IS_MACOS:
-            await self._safe_mode.check()
+        if IS_MACOS and await self._safe_mode.check() == Action.BACK_TO_SAFE_MODE:
+            # Core survived the stop, so nothing happened. Don't retry on every check.
+            self._cache[HASS_WATCHDOG_NEXT_ATTEMPT] = (
+                time.monotonic() + HASS_WATCHDOG_RETRY_SECONDS
+            )
 
     async def _back_to_safe_mode(self) -> None:
-        """Leave a normal start that landed Core in recovery mode."""
+        """Try safe mode for a Core in recovery mode, unless a backup just started."""
+        if self.sys_core.state != CoreState.RUNNING:
+            return
         _LOGGER.error(
             "Home Assistant Core came up in recovery mode, going to safe mode"
         )
         try:
             await self._enter_safe_mode()
-        except HomeAssistantError as err:
+        except (HomeAssistantError, JobException) as err:
             await self._reanimate_failed(
                 err, True, HASS_WATCHDOG_MAX_REANIMATE_ATTEMPTS
             )
+            # Rejected: another job just started. Otherwise don't repeat it every
+            # 2 minutes in silence, if Core is still up.
+            if not isinstance(err, HomeAssistantJobError):
+                await self._safe_mode.return_failed()
 
     async def _config_problem(self) -> str | None:
-        """Return what stops the check Core itself does before a restart, if anything."""
+        """Return what fails Core's config check, if anything.
+
+        The check sees custom integrations even when safe mode would hide them, so
+        failing it doesn't prove a safe start can't get past the problem.
+        """
         try:
             async with asyncio.timeout(HASS_WATCHDOG_CONFIG_CHECK_SECONDS):
                 result = await self.sys_homeassistant.core.check_config()
         except (HomeAssistantError, OSError) as err:
             _LOGGER.error("Can't check Home Assistant Core's config: %s", err)
-            return "its configuration could not be checked"
+            return CONFIG_UNCHECKED
         if result.valid:
             return None
         _LOGGER.error("Home Assistant Core's config check failed:\n%s", result.log)
-        return "its configuration does not pass the check"
+        return CONFIG_INVALID
+
+    async def _hold_in_recovery(self, problem: str) -> None:
+        """Try safe mode instead of a normal start, and say why.
+
+        Failing the check is no proof: it can fail for something a start gets past,
+        and the problem can be repaired, so this repeats at each look. It costs little,
+        as with bad YAML Core stops right after reading it.
+        """
+        await self._back_to_safe_mode()
+        if self._safe_mode.waiting:
+            await self._safe_mode.postpone(problem)
 
     async def _try_normal_start(self) -> None:
-        """Give a Core the watchdog put in safe mode another normal start."""
+        """Give a Core in safe mode or recovery mode another normal start."""
         # This restarts a healthy Core on purpose. Core refuses to restart during a
         # database migration or on a bad config, which would land it in recovery mode.
         try:
@@ -286,19 +315,23 @@ class Tasks(CoreSysAttributes):
             "migration_in_progress"
         ):
             return
-        if problem := await self._config_problem():
-            await self._safe_mode.postpone(
-                f"Home Assistant Core stayed in safe mode, because {problem}."
-            )
-            return
+        problem = await self._config_problem()
         # Someone may have stopped or restarted Core during the check.
         if not await self._safe_mode.same_core():
             return
-        await self._safe_mode.return_started()
         # A backup could have started during the check.
         if self.sys_core.state != CoreState.RUNNING:
-            await self._safe_mode.return_rejected()
             return
+        if self._safe_mode.in_recovery:
+            if problem == CONFIG_INVALID:
+                await self._hold_in_recovery(problem)
+                return
+            # A check that can't run mustn't keep Core here for good: at worst the
+            # restart lands in recovery mode again. In safe mode it would cost more.
+        elif problem:
+            await self._safe_mode.postpone(problem)
+            return
+        await self._safe_mode.return_started()
 
         _LOGGER.warning("Watchdog is trying Home Assistant Core without safe mode")
         try:
@@ -322,8 +355,12 @@ class Tasks(CoreSysAttributes):
             await self._back_to_safe_mode()
 
     async def _check_safe_mode(self) -> None:
-        """Look after a safe mode run, while Core looks healthy."""
-        if not self._safe_mode.active or self.sys_core.state != CoreState.RUNNING:
+        """Look after a safe mode or recovery mode run, while Core looks healthy."""
+        if self.sys_core.state != CoreState.RUNNING:
+            return
+        if not self._safe_mode.active:
+            await self._safe_mode.notice_recovery()
+        if not self._safe_mode.active:
             return
         action = await self._safe_mode.check()
         if action == Action.NORMAL_START:
@@ -449,7 +486,10 @@ class Tasks(CoreSysAttributes):
                 await core.start()
             else:
                 await core.restart()
-        except HomeAssistantError as err:
+        except (HomeAssistantError, JobException) as err:
+            # An unexpected error inside a job arrives as a plain JobException.
+            if not IS_MACOS and not isinstance(err, HomeAssistantError):
+                raise
             await self._reanimate_failed(err, safe_mode, reanimate_fails)
         else:
             self._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 0
