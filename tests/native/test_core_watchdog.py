@@ -5,9 +5,11 @@ These run without the coresys fixture, which needs a D-Bus daemon.
 
 import asyncio
 import inspect
+import json
 import os
 from pathlib import Path
 import sys
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from awesomeversion import AwesomeVersion
@@ -17,13 +19,21 @@ from supervisor.apps.app import App
 from supervisor.const import AppState, CoreState
 from supervisor.docker.const import ContainerState
 from supervisor.docker.monitor import DockerContainerStateEvent
-from supervisor.exceptions import AppsError, DockerError, HomeAssistantError
+from supervisor.exceptions import (
+    AppsError,
+    DockerError,
+    HomeAssistantAPIError,
+    HomeAssistantError,
+    HomeAssistantJobError,
+    JobException,
+)
 from supervisor.homeassistant.api import APIState
 from supervisor.misc.tasks import (
     HASS_WATCHDOG_LAST_HUNG_RESTART,
     HASS_WATCHDOG_NEXT_ATTEMPT,
     HASS_WATCHDOG_NOT_RUNNING_GRACE,
     HASS_WATCHDOG_NOT_RUNNING_SINCE,
+    HASS_WATCHDOG_REANIMATE_FAILURES,
     HASS_WATCHDOG_RECENT_HUNG_SECONDS,
     Tasks,
 )
@@ -32,8 +42,27 @@ from supervisor.native.homeassistant import (
     HUNG_STOP_TIMEOUT,
     STOP_TIMEOUT,
     NativeHomeAssistant,
+    _run as native_run,
 )
 from supervisor.native.launchd import LaunchAgent, LaunchdError, ServiceStatus
+from supervisor.native.safe_mode import FIRST_WAIT, MAX_WAIT, STATE_FILE
+
+CORE_PID = 100
+_data_dir: Path
+
+
+@pytest.fixture(autouse=True)
+def data_dir(tmp_path: Path) -> Path:
+    """Give each test its own Supervisor data folder."""
+    global _data_dir  # noqa: PLW0603 # pylint: disable=global-statement
+    _data_dir = tmp_path
+    (tmp_path / "core").mkdir()
+    (tmp_path / "config").mkdir()
+    return tmp_path
+
+
+def _in_executor(funct, *args):
+    return asyncio.get_running_loop().run_in_executor(None, funct, *args)
 
 
 def make_tasks(*, running: bool = True, api_ok: bool = True) -> tuple[Tasks, MagicMock]:
@@ -55,6 +84,14 @@ def make_tasks(*, running: bool = True, api_ok: bool = True) -> tuple[Tasks, Mag
     core.start = AsyncMock()
     core.restart = AsyncMock()
     core.rebuild = AsyncMock()
+    coresys.config.path_supervisor = _data_dir
+    coresys.config.path_homeassistant = _data_dir / "config"
+    coresys.run_in_executor = _in_executor
+    homeassistant.api.get_config = AsyncMock(return_value={"safe_mode": False})
+    homeassistant.api.make_request.return_value.__aenter__.return_value.status = 200
+    core.instance.agent.status = AsyncMock(
+        return_value=ServiceStatus(True, True, CORE_PID, None)
+    )
     return Tasks(coresys), core
 
 
@@ -92,10 +129,10 @@ async def test_keeps_trying_after_failures_and_error_state():
     for _ in range(20):
         await tick(tasks)
 
-    # One safe mode attempt after five failures, normal starts for the rest.
-    assert core.rebuild.await_count == 1
+    # Every sixth attempt is safe mode: one failure there must not rule it out.
+    assert core.rebuild.await_count == 3
     assert core.rebuild.await_args.kwargs == {"safe_mode": True}
-    assert core.start.await_count == 19
+    assert core.start.await_count == 17
 
 
 async def test_recovery_resets_the_count():
@@ -630,3 +667,881 @@ async def test_poll_does_not_report_running_over_a_stop(cls: type):
     ):
         await cls._watch(native)
     native._fire.assert_not_called()
+
+
+def state_file() -> Path:
+    """Return where the watchdog's safe mode state is kept."""
+    return _data_dir / "core" / STATE_FILE
+
+
+def saved_state() -> dict | None:
+    """Return the watchdog's safe mode state on disk."""
+    return json.loads(state_file().read_text()) if state_file().exists() else None
+
+
+def marker() -> Path:
+    """Return the marker Core reads at start."""
+    return _data_dir / "config" / "safe-mode"
+
+
+class FakeCore:
+    """Core as far as the watchdog can see it, honouring the safe mode marker."""
+
+    def __init__(self, tasks: Tasks, core: MagicMock) -> None:
+        """Replace the mocks with behaviour."""
+        self.tasks = tasks
+        self.core = core
+        self.pid: int | None = CORE_PID
+        self.safe = False
+        self.recovery = False
+        self.broken = False  # A normal start crashes; safe mode works.
+        self.recovery_on_start = False
+        self.wont_stop = False
+        self.next_pid = CORE_PID
+        self.notify_fails = False
+        tasks.coresys.delivered = []
+        api = tasks.sys_homeassistant.api
+        api.make_request = MagicMock(side_effect=self._request)
+        api.get_config = AsyncMock(side_effect=self._config)
+        core.is_running = AsyncMock(side_effect=lambda: self.pid is not None)
+        core.instance.agent.status = AsyncMock(side_effect=self._status)
+        core.start = AsyncMock(side_effect=self._start)
+        core.restart = AsyncMock(side_effect=self._restart)
+        core.rebuild = AsyncMock(side_effect=self._rebuild)
+        core.check_config = AsyncMock(return_value=MagicMock(valid=True))
+        api.get_core_state = AsyncMock(
+            return_value={"state": "RUNNING", "recorder_state": {}}
+        )
+
+    def _request(self, method: str, path: str, json: dict) -> MagicMock:
+        assert (method, path) == (
+            "post",
+            "api/services/persistent_notification/create",
+        )
+
+        async def enter() -> MagicMock:
+            # A Core that isn't running can't take a notification.
+            if self.pid is None or self.notify_fails:
+                raise HomeAssistantAPIError
+            self.tasks.coresys.delivered.append(json["message"])
+            return MagicMock(status=200)
+
+        context = MagicMock()
+        context.__aenter__ = AsyncMock(side_effect=enter)
+        return context
+
+    async def _config(self) -> dict:
+        return {"safe_mode": self.safe, "recovery_mode": self.recovery}
+
+    async def _status(self) -> ServiceStatus:
+        return ServiceStatus(self.pid is not None, self.pid is not None, self.pid, None)
+
+    def run_core(self) -> None:
+        """Start a new process, which reads and removes the marker."""
+        self.safe = marker().exists()
+        marker().unlink(missing_ok=True)
+        self.recovery = self.recovery_on_start
+        if self.broken and not self.safe:
+            self.pid = None
+            raise HomeAssistantError
+        self.next_pid += 1
+        self.pid = self.next_pid
+
+    async def _start(self) -> None:
+        if self.pid is None:
+            await asyncio.get_running_loop().run_in_executor(None, self.run_core)
+
+    async def _restart(self) -> None:
+        if self.wont_stop:
+            raise HomeAssistantError
+        self.pid = None
+        await self._start()
+
+    async def _rebuild(self, *, safe_mode: bool = False) -> None:
+        loop = asyncio.get_running_loop()
+        if safe_mode:
+            await loop.run_in_executor(None, marker().touch)
+        if not self.wont_stop:
+            self.pid = None
+        await self._start()
+
+    def clear_calls(self) -> None:
+        """Forget calls so far, keeping the behaviour."""
+        self.core.start.reset_mock()
+        self.core.restart.reset_mock()
+        self.core.rebuild.reset_mock()
+        self.tasks.coresys.delivered.clear()
+
+
+def notifications(tasks: Tasks) -> list[str]:
+    """Return the messages Core received as persistent notifications."""
+    return tasks.coresys.delivered
+
+
+async def fake_in_safe_mode() -> tuple[Tasks, MagicMock, FakeCore]:
+    """Fail five starts, so the sixth attempt goes into safe mode and works."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    for _ in range(6):
+        await tick(tasks)
+    assert fake.safe
+    assert saved_state()["phase"] == "in_safe_mode"
+    fake.clear_calls()
+    return tasks, core, fake
+
+
+def after(seconds: int):
+    """Move the clock the state file uses."""
+    return patch("time.time", return_value=time.time() + seconds)
+
+
+async def test_entering_safe_mode_is_recorded_and_announced():
+    """Test the state is saved with the new Core's pid, and the user is told."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    for _ in range(6):
+        await tick(tasks)
+
+    state = saved_state()
+    assert state["pid"] == fake.pid
+    assert state["wait"] == FIRST_WAIT
+    assert abs(state["retry_at"] - (time.time() + FIRST_WAIT)) < 5
+    assert len(notifications(tasks)) == 1
+    assert "safe mode" in notifications(tasks)[0]
+
+
+async def test_intent_is_saved_before_the_attempt():
+    """Test a Supervisor killed during the start can still pick it up."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    seen = []
+    real_rebuild = core.rebuild.side_effect
+
+    async def rebuild(*, safe_mode: bool = False) -> None:
+        loop = asyncio.get_running_loop()
+        seen.append(await loop.run_in_executor(None, saved_state))
+        await real_rebuild(safe_mode=safe_mode)
+
+    core.rebuild.side_effect = rebuild
+    for _ in range(6):
+        await tick(tasks)
+    assert seen[0]["phase"] == "entering"
+
+
+async def test_stays_until_the_time_comes():
+    """Test a healthy Core in safe mode isn't restarted early."""
+    tasks, core, _ = await fake_in_safe_mode()
+    with after(FIRST_WAIT - 60):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state() is not None
+
+
+async def test_goes_back_to_normal_when_the_time_comes():
+    """Test the stuck safe mode: a healthy looking Core gets a normal start."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once_with()
+    core.rebuild.assert_not_called()
+    assert not fake.safe
+    assert saved_state() is None
+    assert len(notifications(tasks)) == 1
+    assert "running normally again" in notifications(tasks)[0]
+
+    with after(FIRST_WAIT * 2):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+
+
+async def test_failed_return_goes_straight_back_and_waits_longer():
+    """Test a broken normal start costs one attempt, not five, and backs off."""
+    tasks, core, fake = await fake_in_safe_mode()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    assert notifications(tasks) == []
+
+    await tick(tasks)
+    core.rebuild.assert_awaited_once_with(safe_mode=True)
+    core.start.assert_not_called()
+    assert fake.safe
+    assert saved_state()["wait"] == FIRST_WAIT * 2
+    assert "tried again and failed" in notifications(tasks)[0]
+
+
+async def test_straight_back_survives_a_supervisor_restart():
+    """Test a failed return isn't forgotten, costing five more failed starts."""
+    tasks, core, _ = await fake_in_safe_mode()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+
+    restarted = Tasks(tasks.coresys)
+    await restarted.load()
+    await tick(restarted)
+    core.rebuild.assert_awaited_once_with(safe_mode=True)
+    core.start.assert_not_called()
+
+
+async def test_failed_return_log_is_not_about_five_attempts(caplog):
+    """Test the log says what happened."""
+    tasks, _, _ = await fake_in_safe_mode()
+    caplog.clear()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    await tick(tasks)
+    assert "failed all" not in caplog.text
+
+
+async def test_wait_is_capped():
+    """Test Core gets a normal start at least once a day, however often it failed."""
+    tasks, core, _ = await fake_in_safe_mode()
+    for round_ in range(1, 13):
+        with after(MAX_WAIT * 2 * round_):
+            await tick(tasks)
+            await tick(tasks)
+    assert core.restart.await_count == 12
+    assert saved_state()["wait"] == MAX_WAIT
+
+
+async def test_recovery_mode_after_the_return_goes_back_to_safe_mode():
+    """Test recovery mode, with locks off, is never reported as normal."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    fake.recovery_on_start = True
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    core.rebuild.assert_awaited_once_with(safe_mode=True)
+    assert fake.safe
+    assert saved_state()["wait"] == FIRST_WAIT * 2
+    assert not any("running normally" in note for note in notifications(tasks))
+
+
+async def test_recovery_mode_after_someone_elses_restart_is_reported():
+    """Test it isn't called normal, and isn't touched."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.pid = 999
+    fake.safe = False
+    fake.recovery = True
+    await tick(tasks)
+    core.restart.assert_not_called()
+    core.rebuild.assert_not_called()
+    assert saved_state() is None
+    assert "recovery mode" in notifications(tasks)[0]
+    assert "running normally" not in notifications(tasks)[0]
+
+
+async def test_stale_marker_during_the_return_is_a_failed_return():
+    """Test landing in safe mode again isn't reported as normal."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    marker().touch()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    assert fake.safe
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert saved_state()["pid"] == fake.pid
+    assert saved_state()["wait"] == FIRST_WAIT * 2
+    assert not any("running normally" in note for note in notifications(tasks))
+
+
+async def test_invalid_config_stays_in_safe_mode_and_says_so():
+    """Test a normal start that would land in recovery mode isn't tried."""
+    tasks, core, fake = await fake_in_safe_mode()
+    core.check_config.return_value = MagicMock(valid=False)
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert fake.safe
+    assert "configuration" in notifications(tasks)[0]
+
+    core.check_config.return_value = MagicMock(valid=True)
+    fake.broken = False
+    with after(FIRST_WAIT * 2 - 60):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    with after(FIRST_WAIT * 2 + 60):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "error", [HomeAssistantError(), TimeoutError(), OSError("can't fork")]
+)
+async def test_config_check_that_breaks_keeps_safe_mode(error: Exception):
+    """Test not knowing keeps safe mode, and isn't called a bad config."""
+    tasks, core, _ = await fake_in_safe_mode()
+    core.check_config.side_effect = error
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert "could not be checked" in notifications(tasks)[0]
+
+
+async def test_config_check_that_hangs_is_given_up_on():
+    """Test a stuck check can't hold up the watchdog."""
+    tasks, core, _ = await fake_in_safe_mode()
+
+    async def hang() -> None:
+        await asyncio.sleep(3600)
+
+    core.check_config = AsyncMock(side_effect=hang)
+    with (
+        patch("supervisor.misc.tasks.HASS_WATCHDOG_CONFIG_CHECK_SECONDS", 0.01),
+        after(FIRST_WAIT + 1),
+    ):
+        async with asyncio.timeout(5):
+            await tick(tasks)
+    core.restart.assert_not_called()
+
+
+async def test_core_that_wont_stop_is_told_and_backs_off():
+    """Test the same Core isn't restarted every two minutes in silence."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.wont_stop = True
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    assert saved_state()["wait"] == FIRST_WAIT * 2
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert len(notifications(tasks)) == 1
+    with after(FIRST_WAIT + 60):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+
+
+async def test_failed_return_stays_spaced():
+    """Test the next attempt keeps the normal spacing."""
+    tasks, core, _ = await fake_in_safe_mode()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+        with patch("supervisor.misc.tasks.async_capture_exception", AsyncMock()):
+            await tasks._watchdog_homeassistant_api()
+    core.rebuild.assert_not_called()
+
+
+async def test_restart_by_someone_else_is_noticed_at_once():
+    """Test a normal restart ends it, without waiting for the timer or restarting."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.pid = 999
+    fake.safe = False
+    await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state() is None
+    assert "running normally again" in notifications(tasks)[0]
+
+
+async def test_new_failure_after_someones_restart_starts_from_thirty_minutes():
+    """Test the 24 h wait of an old problem isn't inherited by a new one."""
+    tasks, _, fake = await fake_in_safe_mode()
+    fake.pid = 999
+    fake.safe = False
+    await tick(tasks)
+
+    fake.clear_calls()
+    fake.pid = None
+    for _ in range(6):
+        await tick(tasks)
+    assert saved_state()["wait"] == FIRST_WAIT
+    assert "tried again" not in notifications(tasks)[-1]
+
+
+async def test_safe_mode_chosen_by_the_user_is_left_alone():
+    """Test the user's own safe mode, which arrives as a new Core in safe mode."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.pid = 999
+    await tick(tasks)
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    core.rebuild.assert_not_called()
+    assert saved_state() is None
+    assert notifications(tasks) == []
+
+
+async def test_watchdogs_own_safe_mode_coming_up_late_is_adopted():
+    """Test a start past its deadline isn't taken for someone else's, or lost."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    real_rebuild = core.rebuild.side_effect
+
+    async def timed_out(*, safe_mode: bool = False) -> None:
+        await real_rebuild(safe_mode=safe_mode)
+        raise HomeAssistantError
+
+    core.rebuild.side_effect = timed_out
+    for _ in range(6):
+        await tick(tasks)
+    assert fake.safe
+    assert saved_state()["phase"] == "entering"
+
+    await tick(tasks)
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert saved_state()["pid"] == fake.pid
+    assert len(notifications(tasks)) == 1
+
+
+async def test_supervisor_restart_during_the_start_is_picked_up():
+    """Test a Core that reached safe mode with no Supervisor watching."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    real_rebuild = core.rebuild.side_effect
+
+    async def killed_midway(*, safe_mode: bool = False) -> None:
+        await real_rebuild(safe_mode=safe_mode)
+        raise asyncio.CancelledError
+
+    core.rebuild.side_effect = killed_midway
+    for _ in range(5):
+        await tick(tasks)
+    with pytest.raises(asyncio.CancelledError):
+        await tick(tasks)
+
+    restarted = Tasks(tasks.coresys)
+    await restarted.load()
+    await tick(restarted)
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert len(notifications(tasks)) == 1
+
+
+async def test_launchctl_failure_changes_nothing():
+    """Test not being able to read the pid isn't taken for a new Core."""
+    tasks, core, fake = await fake_in_safe_mode()
+    pid = fake.pid
+    core.instance.agent.status = AsyncMock(
+        return_value=ServiceStatus(False, False, None, None)
+    )
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state()["pid"] == pid
+
+
+async def test_no_restart_on_a_guess():
+    """Test no restart happens while Core can't say what mode it is in."""
+    tasks, core, fake = await fake_in_safe_mode()
+    api = tasks.sys_homeassistant.api
+    real_config = api.get_config.side_effect
+    api.get_config.side_effect = HomeAssistantAPIError()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state() is not None
+
+    api.get_config.side_effect = real_config
+    fake.broken = False
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+
+
+async def test_waits_for_a_backup_to_finish():
+    """Test a timed restart doesn't hit a backup in progress."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    tasks.sys_core.state = CoreState.FREEZE
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state() is not None
+
+    tasks.sys_core.state = CoreState.RUNNING
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+
+
+async def test_backup_starting_during_the_config_check_stops_the_restart():
+    """Test the state is checked again right before restarting."""
+    tasks, core, _ = await fake_in_safe_mode()
+
+    async def backup_starts() -> MagicMock:
+        tasks.sys_core.state = CoreState.FREEZE
+        return MagicMock(valid=True)
+
+    core.check_config.side_effect = backup_starts
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state()["phase"] == "in_safe_mode"
+
+
+@pytest.mark.parametrize(
+    "core_state",
+    [
+        {
+            "state": "RUNNING",
+            "recorder_state": {
+                "migration_in_progress": True,
+                "migration_is_live": True,
+            },
+        },
+        {
+            "state": "NOT_RUNNING",
+            "recorder_state": {
+                "migration_in_progress": True,
+                "migration_is_live": False,
+            },
+        },
+    ],
+)
+async def test_waits_for_a_database_migration(core_state: dict):
+    """Test a timed restart doesn't hit a migration, as Core itself refuses to."""
+    tasks, core, _ = await fake_in_safe_mode()
+    tasks.sys_homeassistant.api.get_core_state.return_value = core_state
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state() is not None
+
+
+async def test_waits_for_a_running_core_job():
+    """Test an update in progress is left alone."""
+    tasks, core, _ = await fake_in_safe_mode()
+    core.in_progress = True
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+    assert saved_state() is not None
+
+
+async def test_rejected_restart_is_not_a_failed_return():
+    """Test losing a race for the job lock doesn't count against Core."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    real_restart = core.restart.side_effect
+    core.restart.side_effect = HomeAssistantJobError()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    assert saved_state()["phase"] == "in_safe_mode"
+
+    core.restart.side_effect = real_restart
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.rebuild.assert_not_called()
+    assert core.restart.await_count == 2
+    assert saved_state() is None
+
+
+async def test_requested_stop_during_safe_mode_is_respected():
+    """Test a Core the user stopped isn't brought back by the timer."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.pid = None
+    core.instance.stop_requested = True
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.start.assert_not_called()
+    core.restart.assert_not_called()
+
+
+async def test_survives_a_supervisor_restart():
+    """Test the timer carries on after a Supervisor restart: Core kept running."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+
+    restarted = Tasks(tasks.coresys)
+    await restarted.load()
+    with after(FIRST_WAIT - 60):
+        await tick(restarted)
+    core.restart.assert_not_called()
+    with after(FIRST_WAIT + 1):
+        await tick(restarted)
+    core.restart.assert_awaited_once()
+    assert saved_state() is None
+
+
+@pytest.mark.parametrize("content", ["{not json", "[]", '{"phase": "nonsense"}'])
+async def test_corrupt_state_file_is_dropped(content: str):
+    """Test a damaged file can't stop the Supervisor from starting."""
+    state_file().write_text(content)
+    tasks, core = make_tasks()
+    FakeCore(tasks, core)
+    await tasks.load()
+    assert not state_file().exists()
+    await tick(tasks)
+    core.restart.assert_not_called()
+
+
+async def test_state_that_cant_be_written_still_runs_the_timer():
+    """Test the normal start still comes back if the file can't be saved."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    (_data_dir / "core").rmdir()
+    for _ in range(6):
+        await tick(tasks)
+    fake.broken = False
+    assert fake.safe
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    assert not fake.safe
+
+
+async def test_marker_removed_when_the_attempt_fails():
+    """Test a marker Core never read can't cause a silent safe mode later."""
+    tasks, core = make_tasks(running=False)
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+
+    async def fail_after_marker(*, safe_mode: bool) -> None:
+        assert safe_mode
+        await asyncio.get_running_loop().run_in_executor(None, marker().touch)
+        raise HomeAssistantError
+
+    core.rebuild.side_effect = fail_after_marker
+    for _ in range(6):
+        await tick(tasks)
+    core.rebuild.assert_awaited_once()
+    assert not marker().exists()
+
+
+async def test_marker_removed_when_core_never_restarted():
+    """Test a stop that failed, so Core carried on and never read the marker."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    core.start.side_effect = HomeAssistantError()
+    fake.wont_stop = True
+    tasks._cache[HASS_WATCHDOG_REANIMATE_FAILURES] = 5
+    tasks.sys_homeassistant.api.get_api_state.return_value = None
+    core.start.side_effect = None
+    for _ in range(2):
+        await tick(tasks)
+    core.rebuild.assert_awaited_once()
+    assert not marker().exists()
+    assert saved_state() is None
+    assert notifications(tasks) == []
+
+
+async def test_marker_removed_when_a_new_core_did_not_read_it():
+    """Test a marker from an attempt that didn't take can't fire on a later restart."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    await tasks._safe_mode.entering()
+    fake.pid = 999
+    marker().touch()
+    await tick(tasks)
+    assert not marker().exists()
+    assert saved_state() is None
+
+
+async def test_notification_failure_changes_nothing():
+    """Test Core refusing a notification can't get in the way of recovery."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.notify_fails = True
+    fake.pid = None
+    fake.broken = True
+    for _ in range(6):
+        await tick(tasks)
+    assert saved_state()["phase"] == "in_safe_mode"
+    fake.broken = False
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_awaited_once()
+    assert saved_state() is None
+
+
+async def test_not_macos_keeps_upstream_behaviour():
+    """Test elsewhere it is one safe mode attempt, and no state once it works."""
+    tasks, core = make_tasks()
+    api = tasks.sys_homeassistant.api
+    api.check_api_state = AsyncMock(return_value=False)
+    core.restart.side_effect = HomeAssistantError()
+    with patch("supervisor.misc.tasks.IS_MACOS", False):
+        for _ in range(12):
+            await tick(tasks)
+        core.rebuild.assert_awaited_once_with(safe_mode=True)
+
+        api.check_api_state.return_value = True
+        with after(MAX_WAIT * 2):
+            await tick(tasks)
+    core.restart.assert_awaited()
+    assert core.restart.await_count == 5
+    assert saved_state() is None
+    api.get_config.assert_not_called()
+    api.make_request.assert_not_called()
+
+
+async def test_failed_way_back_from_recovery_mode_keeps_trying():
+    """Test recovery mode, with locks off, doesn't end the run if a rebuild fails."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    fake.recovery_on_start = True
+    real_rebuild = core.rebuild.side_effect
+    core.rebuild.side_effect = HomeAssistantJobError()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.rebuild.assert_awaited_once()
+    assert saved_state() is not None
+
+    core.rebuild.side_effect = HomeAssistantError()
+    await tick(tasks)
+    assert core.rebuild.await_count == 2
+    assert saved_state() is not None
+
+    core.rebuild.side_effect = real_rebuild
+    await tick(tasks)
+    assert fake.safe
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert not any("will not restart" in note for note in notifications(tasks))
+
+
+async def test_wait_doubles_once_however_many_safe_starts_fail():
+    """Test repeated attempts at one return aren't each counted as another."""
+    tasks, core, _ = await fake_in_safe_mode()
+    real_rebuild = core.rebuild.side_effect
+    core.rebuild.side_effect = HomeAssistantError()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    for _ in range(7):
+        await tick(tasks)
+    core.rebuild.side_effect = real_rebuild
+    assert core.rebuild.await_count == 2
+    for _ in range(6):
+        await tick(tasks)
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert saved_state()["wait"] == FIRST_WAIT * 2
+
+
+async def test_core_replaced_during_the_config_check_is_not_restarted():
+    """Test a stop or a restart by the user during the check isn't overridden."""
+    tasks, core, fake = await fake_in_safe_mode()
+
+    async def user_restarts() -> MagicMock:
+        fake.pid = 999
+        return MagicMock(valid=True)
+
+    core.check_config.side_effect = user_restarts
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.restart.assert_not_called()
+
+
+async def test_backup_during_the_restart_defers_the_way_back():
+    """Test landing in recovery mode during a backup waits for the backup."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.broken = False
+    fake.recovery_on_start = True
+    real_restart = core.restart.side_effect
+
+    async def backup_starts() -> None:
+        await real_restart()
+        tasks.sys_core.state = CoreState.FREEZE
+
+    core.restart.side_effect = backup_starts
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    core.rebuild.assert_not_called()
+    await tick(tasks)
+    core.rebuild.assert_not_called()
+
+    tasks.sys_core.state = CoreState.RUNNING
+    await tick(tasks)
+    core.rebuild.assert_awaited_once_with(safe_mode=True)
+
+
+async def test_unexpected_error_in_the_restart_counts_as_failed():
+    """Test it keeps the spacing, and what is left of Core is looked after."""
+    tasks, core, fake = await fake_in_safe_mode()
+    core.restart.side_effect = JobException()
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+        with patch("supervisor.misc.tasks.async_capture_exception", AsyncMock()):
+            await tasks._watchdog_homeassistant_api()
+    core.restart.assert_awaited_once()
+    assert fake.safe
+    assert saved_state()["phase"] == "in_safe_mode"
+    assert saved_state()["wait"] == FIRST_WAIT * 2
+
+
+async def test_rejected_safe_attempt_leaves_the_marker_alone():
+    """Test it may be from the job that holds the lock, such as the user's."""
+    tasks, core = make_tasks()
+    fake = FakeCore(tasks, core)
+    fake.pid = None
+    fake.broken = True
+    core.rebuild.side_effect = HomeAssistantJobError()
+    for _ in range(5):
+        await tick(tasks)
+    marker().touch()
+    await tick(tasks)
+    core.rebuild.assert_awaited_once()
+    assert marker().exists()
+
+
+async def test_rebuild_that_did_nothing_on_a_safe_core_removes_the_marker():
+    """Test the same Core, already in safe mode, never read the new marker."""
+    tasks, core, fake = await fake_in_safe_mode()
+    fake.wont_stop = True
+    core.restart.side_effect = None
+    await tasks._safe_mode.entering()
+    await tasks.sys_homeassistant.core.rebuild(safe_mode=True)
+    assert marker().exists()
+    await tasks._safe_mode.check()
+    assert not marker().exists()
+    assert saved_state()["phase"] == "in_safe_mode"
+
+
+async def test_interrupted_return_starts_over():
+    """Test a Supervisor restart before Core was touched doesn't count against it."""
+    tasks, core, fake = await fake_in_safe_mode()
+    await tasks._safe_mode.return_started()
+
+    restarted = Tasks(tasks.coresys)
+    await restarted.load()
+    tasks.sys_homeassistant.api.get_core_state.return_value = {"state": "STARTING"}
+    with after(FIRST_WAIT + 1):
+        await tick(restarted)
+    core.restart.assert_not_called()
+    assert not restarted._safe_mode.returning
+    assert fake.safe
+
+
+async def test_message_after_a_supervisor_restart_says_since_when():
+    """Test the start of the run is kept on disk, for the closing message."""
+    tasks, _, fake = await fake_in_safe_mode()
+    fake.broken = False
+    restarted = Tasks(tasks.coresys)
+    await restarted.load()
+    with after(FIRST_WAIT + 1):
+        await tick(restarted)
+    assert "It had been in safe mode since" in notifications(tasks)[0]
+
+
+async def test_invalid_config_says_so_and_logs_why(caplog):
+    """Test the check's own output reaches the log."""
+    tasks, core, _ = await fake_in_safe_mode()
+    core.check_config.return_value = MagicMock(valid=False, log="bad thing on line 3")
+    with after(FIRST_WAIT + 1):
+        await tick(tasks)
+    assert "does not pass the check" in notifications(tasks)[0]
+    assert "bad thing on line 3" in caplog.text
+
+
+async def test_cancelled_command_does_not_leave_its_process_behind():
+    """Test the config check's process goes when the wait for it is given up."""
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.5):
+            await native_run("/bin/sh", "-c", f"echo $$ > {_data_dir}/pid; sleep 60")
+    await asyncio.sleep(0.2)
+    pid = int((_data_dir / "pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)

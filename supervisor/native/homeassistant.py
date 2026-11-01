@@ -91,7 +91,11 @@ async def _run(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    out, _ = await proc.communicate()
+    try:
+        out, _ = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.kill()
+        raise
     return CommandReturn(
         proc.returncode or 0, out.decode(errors="replace").splitlines(True)
     )
