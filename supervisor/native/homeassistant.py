@@ -14,12 +14,17 @@ Optional files under ``<data>/core`` shape every install:
 * ``patches/*.patch``: unified diffs applied to site-packages after install,
   for fixes not yet released upstream. An install fails if a patch does not
   apply, so a patch never silently goes missing on update.
+
+A newer Core migrates ``.storage`` on its first start, and the previous version
+refuses the newer formats. So an update keeps the ``.storage`` the previous
+version left in ``<data>/core/storage-snapshot``, and a rollback puts it back.
 """
 
 from __future__ import annotations
 
 import asyncio
 from collections import deque
+from contextlib import suppress
 import hashlib
 from ipaddress import IPv4Address
 import json
@@ -28,10 +33,11 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 
-from awesomeversion import AwesomeVersion
+from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
 
 from ..const import SOCKET_CORE, BusEvent
 from ..docker.const import (
@@ -334,6 +340,284 @@ async def carry_over_packages(old_venv: Path, new_venv: Path) -> CommandReturn |
     )
 
 
+STORAGE_SNAPSHOT = "storage-snapshot"
+STORAGE_ROLLED_BACK = "storage-rolled-back"
+SNAPSHOT_INFO = "snapshot.json"
+ROLLBACK_SUFFIX = ".supervisor-rollback"
+
+
+def _write_private(path: Path, content: bytes, mode: int) -> None:
+    """Write a file that is never readable by others before it gets its mode."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as file:
+        file.write(content)
+        file.flush()
+        os.fsync(file.fileno())
+    path.chmod(mode)
+
+
+def _copy_unless_vanished(src: str, dst: str) -> None:
+    """Copy a file's content and permissions, or nothing if it went away.
+
+    Auth stores are owner-only. macOS file flags are not copied, so a locked
+    file can't make the copy undeletable.
+    """
+    with suppress(FileNotFoundError):
+        source = Path(src)
+        _write_private(
+            Path(dst), source.read_bytes(), stat.S_IMODE(source.stat().st_mode)
+        )
+
+
+def _copy_tree(src: Path, dst: Path) -> None:
+    """Copy a folder's files and permissions, not flags; symlinks stay links."""
+    if not src.is_dir():
+        raise FileNotFoundError(src)
+    dst.mkdir(parents=True)
+    for path in sorted(src.rglob("*")):
+        if path.name.endswith(ROLLBACK_SUFFIX):
+            continue
+        target = dst / path.relative_to(src)
+        if path.is_symlink():
+            target.symlink_to(path.readlink())
+        elif path.is_dir():
+            target.mkdir()
+        else:
+            _copy_unless_vanished(str(path), str(target))
+
+
+def snapshot_storage(
+    path_core: Path, config: Path, from_version: str, to_version: str
+) -> None:
+    """Keep the .storage that from_version leaves, for a rollback from to_version.
+
+    Run while no Core is running. On failure no snapshot is left at all, so an
+    older one can never be restored by mistake.
+    """
+    snapshot = path_core / STORAGE_SNAPSHOT
+    staging = path_core / f"{STORAGE_SNAPSHOT}.new"
+    shutil.rmtree(staging, ignore_errors=True)
+    try:
+        _copy_tree(config / ".storage", staging / ".storage")
+        (staging / SNAPSHOT_INFO).write_text(
+            json.dumps(
+                {
+                    "from": from_version,
+                    "to": to_version,
+                    "taken": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                }
+            )
+        )
+        shutil.rmtree(snapshot, ignore_errors=True)
+        staging.rename(snapshot)
+    except OSError:
+        shutil.rmtree(staging, ignore_errors=True)
+        shutil.rmtree(snapshot, ignore_errors=True)
+        raise
+
+
+def _parse(content: bytes) -> Any:
+    try:
+        return json.loads(content)
+    except ValueError:
+        return None
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return _parse(path.read_bytes())
+    except OSError:
+        return None
+
+
+def _files(folder: Path) -> dict[Path, Path]:
+    """Return {path relative to folder: path} of a folder's regular files."""
+    return {
+        path.relative_to(folder): path
+        for path in folder.rglob("*")
+        if path.is_file()
+        and not path.is_symlink()
+        and not path.name.endswith(ROLLBACK_SUFFIX)
+    }
+
+
+def _links(folder: Path) -> set[Path]:
+    """Return the paths relative to folder of a folder's symlinks."""
+    return {path.relative_to(folder) for path in folder.rglob("*") if path.is_symlink()}
+
+
+def _staged(path: Path) -> Path:
+    return path.with_name(f".{path.name}{ROLLBACK_SUFFIX}")
+
+
+def _make_parents(path: Path) -> list[Path]:
+    """Create path's missing parent folders; return them, deepest first."""
+    missing = []
+    parent = path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return missing
+
+
+def _remove_empty(folders: list[Path]) -> None:
+    """Remove the given folders, deepest first, where they are empty."""
+    for folder in sorted(folders, key=lambda f: len(f.parts), reverse=True):
+        with suppress(OSError):
+            folder.rmdir()
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _is_upgrade(previous: AwesomeVersion, version: AwesomeVersion) -> bool:
+    """Return True unless version is the same as or older than previous.
+
+    A downgrade keeps the snapshot of the last upgrade: the older Core reads
+    the newer formats no better than before.
+    """
+    try:
+        return version > previous
+    except AwesomeVersionCompareException:
+        return str(version) != str(previous)
+
+
+class StorageRestore(NamedTuple):
+    """What a rollback did to .storage."""
+
+    put_back: list[str]
+    moved_aside: list[str]
+
+
+def restore_storage(
+    path_core: Path, config: Path, to_version: str, from_version: str
+) -> StorageRestore | None:
+    """Put .storage back exactly as to_version left it before from_version ran.
+
+    A newer Core changes stores in ways the older one can't use, and not only
+    by raising major versions: minor migrations rename and re-key entries, and
+    the stores refer to each other. So a rollback returns all of it. What the
+    newer Core wrote is kept in ``<data>/core/storage-rolled-back``.
+
+    Every copy and staged file is written before anything in .storage changes;
+    then only renames and removals run, and if one fails, those already done
+    are undone. Return None, changing nothing, unless the snapshot is of that
+    update.
+    """
+    snapshot = path_core / STORAGE_SNAPSHOT
+    info = _read_json(snapshot / SNAPSHOT_INFO)
+    if (
+        not isinstance(info, dict)
+        or info.get("from") != to_version
+        or info.get("to") != from_version
+        or not (snapshot / ".storage").is_dir()
+    ):
+        return None
+
+    storage = config / ".storage"
+    for leftover in storage.rglob(f".*{ROLLBACK_SUFFIX}"):
+        leftover.unlink(missing_ok=True)
+    saved, current = _files(snapshot / ".storage"), _files(storage)
+    changed = [
+        name
+        for name in sorted(saved)
+        if name not in current or current[name].read_bytes() != saved[name].read_bytes()
+    ]
+    # A symlink Core wrote through became a file; it isn't new.
+    created = sorted(current.keys() - saved.keys() - _links(snapshot / ".storage"))
+    if not changed and not created:
+        return StorageRestore([], [])
+
+    kept = path_core / STORAGE_ROLLED_BACK
+    shutil.rmtree(kept, ignore_errors=True)
+    staged: list[Path] = []
+    made: list[Path] = []
+    try:
+        for name in changed + created:
+            if name in current:
+                (kept / name).parent.mkdir(parents=True, exist_ok=True)
+                _write_private(
+                    kept / name,
+                    current[name].read_bytes(),
+                    stat.S_IMODE(current[name].stat().st_mode),
+                )
+        for name in changed:
+            dst = storage / name
+            if dst.is_dir() and not dst.is_symlink():
+                raise IsADirectoryError(f"{dst} is a folder now")
+            made += _make_parents(dst)
+            staged.append(_staged(dst))
+            _write_private(
+                staged[-1],
+                saved[name].read_bytes(),
+                stat.S_IMODE(saved[name].stat().st_mode),
+            )
+    except OSError:
+        for path in staged:
+            path.unlink(missing_ok=True)
+        _remove_empty(made)
+        raise
+
+    done: list[Path] = []
+    try:
+        # Removals first: on a case-insensitive disk a created "foo" is the
+        # same file as a "Foo" put back, and removing it after would lose it.
+        for name in created:
+            (storage / name).unlink()
+            done.append(name)
+        for name in changed:
+            _staged(storage / name).replace(storage / name)
+            done.append(name)
+        _fsync_dir(storage)
+    except OSError:
+        _undo_restore(storage, kept, done, current)
+        for path in staged:
+            path.unlink(missing_ok=True)
+        _remove_empty(made)
+        raise
+    _remove_empty(
+        [
+            storage / folder
+            for name in created
+            for folder in name.parents
+            if folder.parts and not (snapshot / ".storage" / folder).is_dir()
+        ]
+    )
+    return StorageRestore([str(n) for n in changed], [str(n) for n in created])
+
+
+def _undo_restore(
+    storage: Path, kept: Path, done: list[Path], current: dict[Path, Path]
+) -> None:
+    """Return the files a failed restore already changed to the newer Core's."""
+    for name in reversed(done):
+        dst = storage / name
+        try:
+            if name in current:
+                kept_file = kept / name
+                _write_private(
+                    _staged(dst),
+                    kept_file.read_bytes(),
+                    stat.S_IMODE(kept_file.stat().st_mode),
+                )
+                _staged(dst).replace(dst)
+            else:
+                dst.unlink(missing_ok=True)
+        except OSError as err:
+            _LOGGER.critical(
+                "%s is left as the older Core had it; the newer Core's copy is %s: %s",
+                dst,
+                kept / name,
+                err,
+            )
+
+
 class NativeHomeAssistant(JobGroup):
     """Replacement for DockerHomeAssistant on a native host."""
 
@@ -343,6 +627,9 @@ class NativeHomeAssistant(JobGroup):
         self._version: AwesomeVersion | None = None
         # Set by HomeAssistantCore.update while it rolls back a failed update.
         self.rolling_back: bool = False
+        # (from, to) of the .storage snapshot this process took for the update
+        # in progress; a rollback restores only that one.
+        self._storage_snapshot: tuple[str, str] | None = None
         # Set by the watchdog: a Core that doesn't answer at all won't stop cleanly
         # (its event loop handles SIGTERM), so don't wait the full timeout. A slow
         # Core can take over 30 s to stop, which HUNG_STOP_TIMEOUT has to allow.
@@ -451,6 +738,11 @@ class NativeHomeAssistant(JobGroup):
         latest: bool = False,
         **kwargs: Any,
     ) -> None:
+        """Install a Core version unless a usable install exists, and use it."""
+        await self._prepare(version)
+        self._version = version
+
+    async def _prepare(self, version: AwesomeVersion) -> None:
         """Install a Core version unless a usable install exists.
 
         The version being rolled back to is reused as is: it was running a
@@ -461,20 +753,115 @@ class NativeHomeAssistant(JobGroup):
         )
         if not reuse:
             await self._install(version)
-        self._version = version
 
     async def update(
         self, version: AwesomeVersion, image: str | None = None, latest: bool = False
     ) -> None:
-        """Install the new version while the old one runs, then stop the old one."""
+        """Install the new version while the old one runs, then stop the old one.
+
+        The new version is recorded only once the old one has stopped, so a
+        failure on the way leaves the Supervisor on the version that still runs.
+        """
         previous = self._version
+        if self.rolling_back:
+            await self._roll_back(version)
+            return
+        self._storage_snapshot = None
         components = await self._running_components()
-        await self.install(version)
-        if previous and str(previous) != str(version) and not self.rolling_back:
+        await self._prepare(version)
+        if previous and str(previous) != str(version):
             await self._carry_over(previous, version)
         if components:
             await self._install_integration_requirements(version, components)
         await self.stop()
+        self._version = version
+        if previous and _is_upgrade(previous, version):
+            await self._snapshot_storage(previous, version)
+
+    async def _roll_back(self, version: AwesomeVersion) -> None:
+        """Switch back to the previous install exactly as it ran.
+
+        No requirements are installed: that needs the network, and must not
+        stand between a broken Core and its rollback.
+        """
+        rolled_back_from = self._version
+        await self._prepare(version)
+        await self.stop()
+        self._version = version
+        if rolled_back_from and str(rolled_back_from) != str(version):
+            await self._restore_storage(rolled_back_from, version)
+
+    async def _snapshot_storage(
+        self, previous: AwesomeVersion, version: AwesomeVersion
+    ) -> None:
+        """Keep previous's .storage for a rollback; never fail the update."""
+        try:
+            await self.sys_run_in_executor(
+                snapshot_storage,
+                self.path_core,
+                self.sys_config.path_homeassistant,
+                str(previous),
+                str(version),
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            # A safety net for the rollback; it must never fail the update.
+            _LOGGER.error(
+                "Can't keep the .storage of Core %s; a rollback from %s may not start: %s",
+                previous,
+                version,
+                err,
+            )
+            return
+        self._storage_snapshot = (str(previous), str(version))
+        _LOGGER.info("Kept the .storage of Core %s for a rollback", previous)
+
+    async def _restore_storage(
+        self, rolled_back_from: AwesomeVersion, version: AwesomeVersion
+    ) -> None:
+        """Give version back the .storage it left before rolled_back_from ran."""
+        taken, self._storage_snapshot = self._storage_snapshot, None
+        restored = None
+        if taken == (str(version), str(rolled_back_from)):
+            try:
+                restored = await self.sys_run_in_executor(
+                    restore_storage,
+                    self.path_core,
+                    self.sys_config.path_homeassistant,
+                    str(version),
+                    str(rolled_back_from),
+                )
+            except Exception as err:  # pylint: disable=broad-except
+                # The rollback must go on whatever happens here.
+                _LOGGER.error(
+                    "Can't put back the .storage of Core %s: %s", version, err
+                )
+                return
+        if restored is None:
+            _LOGGER.warning(
+                "No .storage snapshot of the update from Core %s to %s; "
+                "Core %s starts on the .storage %s left",
+                version,
+                rolled_back_from,
+                version,
+                rolled_back_from,
+            )
+        elif restored.put_back or restored.moved_aside:
+            _LOGGER.warning(
+                "Put .storage back as Core %s left it: %d files put back, %d files "
+                "Core %s created moved aside; Core %s's copies are in %s",
+                version,
+                len(restored.put_back),
+                len(restored.moved_aside),
+                rolled_back_from,
+                rolled_back_from,
+                self.path_core / STORAGE_ROLLED_BACK,
+            )
+        else:
+            _LOGGER.info(
+                "Core %s left .storage as Core %s had it; nothing put back",
+                rolled_back_from,
+                version,
+            )
 
     async def _carry_over(
         self, previous: AwesomeVersion, version: AwesomeVersion
