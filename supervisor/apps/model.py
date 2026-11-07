@@ -6,6 +6,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from datetime import datetime
 import errno
+import fcntl
 import logging
 import os
 from pathlib import Path
@@ -163,11 +164,20 @@ def read_in_repository(path: Path, repository: Path) -> bytes:
     # O_NONBLOCK keeps a FIFO swapped in after resolving from blocking the open
     fd = os.open(resolved, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
     with os.fdopen(fd, "rb") as file:
-        opened = Path(f"/proc/self/fd/{fd}").readlink()
+        opened = _opened_path(fd)
         _check_in_repository(path, opened, repository)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise FileNotFoundError(errno.ENOENT, "Not a regular file", str(path))
         return file.read()
+
+
+def _opened_path(fd: int) -> Path:
+    """Return the real path of an open file."""
+    if IS_MACOS:
+        # macOS has no /proc; the kernel reports the path of the open file
+        path = fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024))
+        return Path(os.fsdecode(path.split(b"\0", 1)[0]))
+    return Path(f"/proc/self/fd/{fd}").readlink()
 
 
 def _check_in_repository(path: Path, resolved: Path, repository: Path) -> None:
