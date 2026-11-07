@@ -87,6 +87,74 @@ class InstallInfo:
         return InstallInfo(run=data["run"], privileged=bool(data.get("privileged")))
 
 
+def _is_unreadable_file(path: Path) -> bool:
+    return path.is_file() and not path.is_symlink() and not os.access(path, os.R_OK)
+
+
+def _unreadable_files(root: Path) -> set[Path]:
+    """Return the folders under root (relative) with files this user can't read."""
+
+    def fail(err: OSError) -> None:
+        raise err
+
+    return {
+        Path(folder).relative_to(root)
+        for folder, _, files in os.walk(root, onerror=fail)
+        if any(_is_unreadable_file(Path(folder, name)) for name in files)
+    }
+
+
+def _placeholder(path: Path) -> None:
+    """Make path an empty file of this user's, for the root helper to fill."""
+    path.unlink(missing_ok=True)
+    os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+
+
+def _copy_readable(root: Path, target: Path) -> None:
+    """Copy root to target; files this user can't read become placeholders.
+
+    Links are copied as links; folders keep their modes and times.
+    """
+    folders = []
+    for folder, dirs, files in os.walk(root):
+        relative = Path(folder).relative_to(root)
+        (target / relative).mkdir(exist_ok=True)
+        folders.append(relative)
+        for name in files + [d for d in dirs if Path(folder, d).is_symlink()]:
+            source, dest = Path(folder, name), target / relative / name
+            if source.is_symlink():
+                dest.symlink_to(source.readlink())
+            elif os.access(source, os.R_OK):
+                with suppress(FileNotFoundError):  # gone since the listing
+                    shutil.copy2(source, dest)
+            elif source.exists():
+                _placeholder(dest)
+    for relative in reversed(folders):
+        shutil.copystat(root / relative, target / relative)
+
+
+def _settle_copies(root: Path, target: Path) -> set[Path]:
+    """Tidy target after the root helper's copy; return folders to copy again.
+
+    A file gone from root since the copy began is dropped. One that appeared
+    meanwhile was created by root and can't be read: it gets a placeholder
+    and its folder is returned.
+    """
+    again = set()
+    for folder, _, files in os.walk(target):
+        relative = Path(folder).relative_to(target)
+        for name in files:
+            copy = Path(folder, name)
+            if copy.is_symlink():
+                continue
+            if not os.path.lexists(root / relative / name):
+                copy.unlink()
+            elif not os.access(copy, os.R_OK):
+                _placeholder(copy)
+                again.add(relative)
+    return again
+
+
 class AgentService:
     """An app run as a LaunchAgent in the user's session."""
 
@@ -434,6 +502,52 @@ class NativeApp(JobGroup):
                 shutil.rmtree, self.path_root / "versions", True
             )
             self._attached_version = None
+
+    async def backup_source(self, scratch: Path) -> Path:
+        """Return the folder to back up the app's data from.
+
+        The Supervisor runs as the user, but a privileged app writes its files
+        as root, often readable by root only (OpenThread's settings, which
+        hold the Thread network's keys). When the data folder has such files,
+        it is copied into scratch: what the Supervisor can read it copies
+        itself, the rest the root helper copies into empty files the
+        Supervisor created first. Writing into an existing file keeps its
+        owner, so the copies stay the Supervisor's to read. Otherwise the
+        data folder itself is returned.
+        """
+        root = self.app.path_data
+        try:
+            unreadable = await self.sys_run_in_executor(_unreadable_files, root)
+        except OSError as err:
+            raise DockerError(f"Can't list the data of {self.app.slug}: {err}") from err
+        if not unreadable:
+            return root
+
+        target = scratch / "data"
+        try:
+            await self.sys_run_in_executor(_copy_readable, root, target)
+            # Files can come and go while this runs (OpenThread writes a temp
+            # file and renames it), so settle the copy and try once more.
+            for _ in range(2):
+                for folder in unreadable:
+                    await helper.call(
+                        "copy", source=str(root / folder), dest=str(target / folder)
+                    )
+                unreadable = await self.sys_run_in_executor(
+                    _settle_copies, root, target
+                )
+                if not unreadable:
+                    return target
+        except (OSError, shutil.Error) as err:
+            raise DockerError(f"Can't copy the data of {self.app.slug}: {err}") from err
+        except helper.HelperError as err:
+            raise DockerError(
+                f"Can't read the root-owned data of {self.app.slug}: {err}"
+            ) from err
+        raise DockerError(
+            f"Can't read the root-owned data of {self.app.slug}: files in "
+            f"{', '.join(str(root / folder) for folder in unreadable)} kept changing"
+        )
 
     async def export_image(self, tar_file: Path) -> None:
         """Nothing to export: a restore reinstalls from the recipe."""

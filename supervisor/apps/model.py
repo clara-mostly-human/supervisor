@@ -11,6 +11,7 @@ import logging
 import os
 from pathlib import Path
 import stat
+from types import SimpleNamespace
 from typing import Any
 
 from awesomeversion import AwesomeVersion, AwesomeVersionException
@@ -905,8 +906,15 @@ class AppModel(JobGroup, ABC):
     ) -> None:
         """Validate if app is available for current system."""
         # A native (macOS) host runs only apps that ship a native recipe.
-        if IS_MACOS and not native_recipe_exists(config.get(ATTR_LOCATION)):
-            raise AppNotSupportedNativeError(logger, app=self)
+        if IS_MACOS and not native_recipe_exists(self._recipe_location(config)):
+            # The app may not be installed (a restore), so its name comes from
+            # the config being checked rather than from installed data.
+            raise AppNotSupportedNativeError(
+                logger,
+                app=SimpleNamespace(
+                    name=config.get(ATTR_NAME, self.slug), slug=self.slug
+                ),
+            )
 
         # Architecture
         if not self.sys_arch.is_supported(config[ATTR_ARCH]):
@@ -932,6 +940,18 @@ class AppModel(JobGroup, ABC):
                 raise AppNotSupportedHomeAssistantVersionError(
                     logger, app=self, version=str(version)
                 )
+
+    def _recipe_location(self, config) -> str | None:
+        """Return the app's source folder, where a native recipe would be.
+
+        Store data carries it; installed data and a backup's metadata don't
+        (since 2026.11 only the store owns the location), so fall back to the
+        store's copy of this app.
+        """
+        if location := config.get(ATTR_LOCATION):
+            return location
+        store = self.sys_store.data.apps.get(self.slug)
+        return store.get(ATTR_LOCATION) if store else None
 
     def _available(self, config) -> bool:
         """Return True if this app is available on this platform."""

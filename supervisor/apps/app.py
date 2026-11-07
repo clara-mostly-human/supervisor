@@ -1548,6 +1548,7 @@ class App(AppModel):
             app_config_used: bool,
             temp_dir: TemporaryDirectory,
             temp_path: Path,
+            data_source: Path,
         ):
             """Start the backup process."""
             # Store local configs/state
@@ -1575,10 +1576,10 @@ class App(AppModel):
                 # Backup metadata
                 backup.add(temp_dir.name, arcname=".")
 
-                # Backup data
+                # Backup data (exclude filters still see the real data path)
                 atomic_contents_add(
                     backup,
-                    self.path_data,
+                    data_source,
                     file_filter=partial(
                         self._is_excluded_by_filter, self.path_data, "data"
                     ),
@@ -1613,11 +1614,27 @@ class App(AppModel):
             TemporaryDirectory, dir=self.sys_config.path_tmp
         )
         temp_path = Path(temp_dir.name)
+        data_dir: TemporaryDirectory | None = None
         _LOGGER.info("Building backup for app %s", self.slug)
         try:
             # store local image
             if self.need_build:
                 await self.instance.export_image(temp_path.joinpath("image.tar"))
+
+            # Natively a privileged app's root-owned files are read through a copy
+            data_source = self.path_data
+            if IS_MACOS:
+                scratch: TemporaryDirectory = await self.sys_run_in_executor(
+                    TemporaryDirectory, dir=self.sys_config.path_tmp
+                )
+                data_dir = scratch
+                try:
+                    data_source = await self.instance.backup_source(  # type: ignore[attr-defined]
+                        Path(scratch.name)
+                    )
+                except DockerError as err:
+                    _LOGGER.error("Can't read the data of app %s: %s", self.slug, err)
+                    raise BackupRestoreUnknownError from err
 
             await self.sys_run_in_executor(
                 partial(
@@ -1627,6 +1644,7 @@ class App(AppModel):
                     app_config_used=self.app_config_used,
                     temp_dir=temp_dir,
                     temp_path=temp_path,
+                    data_source=data_source,
                 )
             )
             _LOGGER.info("Finish backup for app %s", self.slug)
@@ -1638,6 +1656,8 @@ class App(AppModel):
             raise BackupRestoreUnknownError from err
         finally:
             await self.sys_run_in_executor(temp_dir.cleanup)
+            if data_dir is not None:
+                await self.sys_run_in_executor(data_dir.cleanup)
             if was_running:
                 wait_for_start = await self.end_backup()
 
