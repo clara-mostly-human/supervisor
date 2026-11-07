@@ -15,6 +15,8 @@ zlib_fast.enable()
 from supervisor import bootstrap  # noqa: E402
 from supervisor.dbus.const import SystemState  # noqa: E402
 from supervisor.exceptions import HassioError  # noqa: E402
+from supervisor.native import IS_MACOS  # noqa: E402
+from supervisor.native.power import hold_awake  # noqa: E402
 from supervisor.utils.blockbuster import BlockBusterManager  # noqa: E402
 from supervisor.utils.logging import activate_log_queue_handler  # noqa: E402
 
@@ -46,6 +48,9 @@ if __name__ == "__main__":
 
     # Check if all information are available to setup Supervisor
     bootstrap.check_environment()
+
+    if IS_MACOS:
+        hold_awake()
 
     # init executor pool
     executor = ThreadPoolExecutor(thread_name_prefix="SyncWorker")
