@@ -698,6 +698,9 @@ class HomeAssistantCore(JobGroup):
         protection. Whether the units may still hold the port afterwards is
         tracked in ``_port_reserved`` so ``port_released`` keeps retrying.
         """
+        # No systemd natively to hold the port
+        if IS_MACOS:
+            return
         async with self._port_lock:
             if await self.is_running():
                 _LOGGER.debug("Home Assistant Core is running, no port reservation")

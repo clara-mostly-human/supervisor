@@ -39,10 +39,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from awesomeversion import AwesomeVersion, AwesomeVersionCompareException
 
-from ..const import SOCKET_CORE, BusEvent
+from ..const import SOCKET_CORE, SOCKET_NAME_SUPERVISOR, BusEvent
 from ..docker.const import (
     ENV_CORE_API_SOCKET,
     ENV_DUPLICATE_LOG_FILE,
+    ENV_SUPERVISOR_SOCKET,
     ENV_TIME,
     ENV_TOKEN,
     ENV_TOKEN_OLD,
@@ -1012,6 +1013,10 @@ class NativeHomeAssistant(JobGroup):
                 lambda: SOCKET_CORE.parent.mkdir(parents=True, exist_ok=True)
             )
             environment[ENV_CORE_API_SOCKET] = str(SOCKET_CORE)
+            # Where the Supervisor listens for Core, as on HA OS
+            environment[ENV_SUPERVISOR_SOCKET] = str(
+                self.sys_homeassistant.path_run_supervisor / SOCKET_NAME_SUPERVISOR
+            )
 
         await self.stop()
 

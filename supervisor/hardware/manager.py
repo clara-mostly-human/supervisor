@@ -147,8 +147,7 @@ class HardwareManager(CoreSysAttributes):
         devices: dict[str, Device] = {}
 
         if IS_MACOS:
-            self._devices = {device.name: device for device in native_devices()}
-            return
+            return {device.name: device for device in native_devices()}
 
         # Extract all devices
         for device in self.udev.list_devices():

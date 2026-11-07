@@ -669,3 +669,39 @@ async def test_install_still_records_the_version_at_once(dirs: tuple[Path, Path]
 
     hass._prepare.assert_awaited_once_with(NEW)
     assert hass._version == NEW
+
+
+@pytest.mark.parametrize("unix_socket", [True, False])
+async def test_run_passes_both_sockets_like_ha_os(tmp_path: Path, unix_socket: bool):
+    """Test Core gets its own socket and the Supervisor's, as a container would."""
+    loop = asyncio.get_running_loop()
+    hass = MagicMock()
+    hass._version = NEW
+    hass.sys_timezone = "UTC"
+    hass.sys_homeassistant.supervisor_token = "token"
+    hass.sys_homeassistant.api.supports_unix_socket = unix_socket
+    hass.sys_homeassistant.path_run_supervisor = tmp_path / "os" / "supervisor" / "core"
+    hass.sys_config.path_homeassistant = tmp_path / "config"
+    hass.path_logs = tmp_path / "logs"
+    hass.sys_run_in_executor = lambda func, *args: loop.run_in_executor(
+        None, func, *args
+    )
+    hass.stop = AsyncMock()
+    hass.start = AsyncMock()
+
+    core_socket = tmp_path / "os" / "core.sock"
+    with patch.object(native_core, "SOCKET_CORE", core_socket):
+        await NativeHomeAssistant.run(hass)
+
+    env = hass.agent.write_plist.call_args.kwargs["environment"]
+    sockets = {
+        key: env.get(key) for key in ("SUPERVISOR_CORE_API_SOCKET", "SUPERVISOR_SOCKET")
+    }
+    expected = {
+        "SUPERVISOR_CORE_API_SOCKET": str(core_socket),
+        "SUPERVISOR_SOCKET": str(
+            tmp_path / "os" / "supervisor" / "core" / "supervisor.sock"
+        ),
+    }
+    assert sockets == (expected if unix_socket else dict.fromkeys(expected))
+    hass.start.assert_awaited_once()
