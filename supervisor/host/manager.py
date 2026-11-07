@@ -12,6 +12,8 @@ from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HassioError, HostLogError, PulseAudioError
 from ..hardware.const import PolicyGroup
 from ..hardware.data import Device
+from ..native import IS_MACOS
+from ..native.host import NativeInfoCenter
 from .apparmor import AppArmorControl
 from .const import NTP_MIN_OS_AGENT_VERSION, HostFeature
 from .control import SystemControl
@@ -35,7 +37,9 @@ class HostManager(CoreSysAttributes):
         self._apparmor: AppArmorControl = AppArmorControl(coresys)
         self._control: SystemControl = SystemControl(coresys)
         self._firewall: FirewallManager = FirewallManager(coresys)
-        self._info: InfoCenter = InfoCenter(coresys)
+        self._info: InfoCenter = (
+            NativeInfoCenter(coresys) if IS_MACOS else InfoCenter(coresys)
+        )
         self._services: ServiceManager = ServiceManager(coresys)
         self._network: NetworkManager = NetworkManager(coresys)
         self._sound: SoundControl = SoundControl(coresys)
