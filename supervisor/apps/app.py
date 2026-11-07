@@ -696,6 +696,10 @@ class App(AppModel):
         port = self.data[ATTR_INGRESS_PORT]
         if port == 0:
             raise RuntimeError(f"No port set for app {self.slug}")
+        # Natively there is no container port: the app listens on the host
+        # port the user mapped its ingress port to
+        if IS_MACOS and (mapped := (self.ports or {}).get(f"{port}/tcp")):
+            return mapped
         return port
 
     @property
