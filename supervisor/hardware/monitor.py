@@ -4,18 +4,22 @@ import asyncio
 import logging
 from pathlib import Path
 from pprint import pformat
+from typing import Any
 
 import pyudev
 
-from ..const import BusEvent
+from ..const import ATTR_TYPE, BusEvent
 from ..coresys import CoreSys, CoreSysAttributes
-from ..exceptions import HardwareNotFound
+from ..exceptions import HardwareNotFound, HomeAssistantWSError
 from ..native import IS_MACOS
+from ..native.hardware import serial_nodes
 from ..resolution.const import UnhealthyReason
 from .const import HardwareAction, UdevKernelAction
 from .data import Device
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
+
+NATIVE_POLL_SECONDS = 5
 
 
 class HwMonitor(CoreSysAttributes):
@@ -27,10 +31,13 @@ class HwMonitor(CoreSysAttributes):
         self.context = context
         self.monitor: pyudev.Monitor | None = None
         self.observer: pyudev.MonitorObserver | None = None
+        self._native_task: asyncio.Task | None = None
 
     async def load(self) -> None:
         """Start hardware monitor."""
         if IS_MACOS:
+            self._native_task = self.sys_create_task(self._native_watch())
+            _LOGGER.info("Started Supervisor hardware monitor (polling serial devices)")
             return
         try:
             self.monitor = pyudev.Monitor.from_netlink(self.context, "kernel")
@@ -51,6 +58,9 @@ class HwMonitor(CoreSysAttributes):
 
     async def unload(self) -> None:
         """Shutdown sessions."""
+        if self._native_task is not None:
+            self._native_task.cancel()
+            self._native_task = None
         if self.observer is None:
             return
 
@@ -131,3 +141,50 @@ class HwMonitor(CoreSysAttributes):
             self.sys_bus.fire_event(BusEvent.HARDWARE_NEW_DEVICE, device)
         elif hw_action == HardwareAction.REMOVE:
             self.sys_bus.fire_event(BusEvent.HARDWARE_REMOVE_DEVICE, device)
+
+    async def _native_watch(self) -> None:
+        """Follow serial devices on macOS, which sends no udev events."""
+        while True:
+            await asyncio.sleep(NATIVE_POLL_SECONDS)
+            try:
+                await self._native_refresh()
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Can't refresh the serial devices: %s", err)
+
+    async def _native_refresh(self) -> None:
+        """Reload the devices if any serial device came, went or moved port."""
+        present = await self.sys_run_in_executor(serial_nodes)
+        known = {device.name for device in self.sys_hardware.devices}
+        if present == known:
+            return
+        await self.sys_hardware.load_devices()
+        current = {device.name: device for device in self.sys_hardware.devices}
+        for name in sorted(known - current.keys()):
+            _LOGGER.info("Detecting %s hardware /dev/%s", HardwareAction.REMOVE, name)
+        added = sorted(current.keys() - known)
+        for name in added:
+            device = current[name]
+            _LOGGER.info(
+                "Detecting %s hardware %s - %s",
+                HardwareAction.ADD,
+                device.path,
+                device.by_id,
+            )
+        if added:
+            await self._native_ask_core_to_scan()
+
+    async def _native_ask_core_to_scan(self) -> None:
+        """Have Core look for new USB devices, as a udev event does on Linux."""
+        if not await self.sys_homeassistant.core.is_running():
+            return
+        try:
+            configuration: (
+                dict[str, Any] | None
+            ) = await self.sys_homeassistant.websocket.async_send_command(
+                {ATTR_TYPE: "get_config"}
+            )
+        except HomeAssistantWSError as err:
+            _LOGGER.debug("Not asking Core to scan for USB devices: %s", err)
+            return
+        if configuration and "usb" in configuration.get("components", []):
+            self.sys_homeassistant.websocket.send_command({ATTR_TYPE: "usb/scan"})

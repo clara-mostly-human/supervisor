@@ -10,7 +10,7 @@ import pyudev
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HardwareNotFound
 from ..native import IS_MACOS
-from ..native.hardware import list_devices as native_devices
+from ..native.hardware import NATIVE_BY_ID, list_devices as native_devices
 from .const import UdevSubsystem
 from .data import Device
 from .disk import HwDisk
@@ -147,7 +147,8 @@ class HardwareManager(CoreSysAttributes):
         devices: dict[str, Device] = {}
 
         if IS_MACOS:
-            return {device.name: device for device in native_devices()}
+            links = self.sys_config.path_supervisor / NATIVE_BY_ID
+            return {device.name: device for device in native_devices(links)}
 
         # Extract all devices
         for device in self.udev.list_devices():
@@ -169,9 +170,13 @@ class HardwareManager(CoreSysAttributes):
 
         return devices
 
+    async def load_devices(self) -> None:
+        """Read the device list again."""
+        self._devices = await self.sys_run_in_executor(self._import_devices)
+
     async def load(self) -> None:
         """Load hardware backend."""
-        self._devices = await self.sys_run_in_executor(self._import_devices)
+        await self.load_devices()
         await self.helper.load()
         await self.monitor.load()
 
