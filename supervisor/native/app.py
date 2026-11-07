@@ -49,7 +49,7 @@ from ..const import AppBoot, BusEvent
 from ..docker.const import ENV_TIME, ENV_TOKEN, ENV_TOKEN_OLD, ContainerState
 from ..docker.monitor import DockerContainerStateEvent
 from ..docker.stats import DockerStats
-from ..exceptions import DockerError
+from ..exceptions import DockerContainerNotRunningError, DockerError
 from ..jobs.job_group import JobGroup
 from . import NATIVE_RECIPE as RECIPE, helper
 from .docker import LOCALHOST
@@ -637,10 +637,8 @@ class NativeApp(JobGroup):
                 f"Can't read the state of app {self.app.slug}: {err}"
             ) from err
         if not status.running or status.pid is None:
-            raise DockerError(f"App {self.app.slug} is not running")
-        if (result := await process_stats(status.pid, one_shot=one_shot)) is None:
-            raise DockerError(f"App {self.app.slug} is not running")
-        return result
+            raise DockerContainerNotRunningError(name=self.name)
+        return await process_stats(status.pid, name=self.name, one_shot=one_shot)
 
     async def write_stdin(self, data: bytes) -> None:
         """Native apps have no stdin channel."""

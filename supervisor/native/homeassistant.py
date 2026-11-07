@@ -52,7 +52,11 @@ from ..docker.const import (
 from ..docker.manager import CommandReturn
 from ..docker.monitor import DockerContainerStateEvent
 from ..docker.stats import DockerStats
-from ..exceptions import DockerError, HomeAssistantAPIError
+from ..exceptions import (
+    DockerContainerNotRunningError,
+    DockerError,
+    HomeAssistantAPIError,
+)
 from ..homeassistant.const import LANDINGPAGE
 from ..jobs.job_group import JobGroup
 from .docker import LOCALHOST
@@ -1190,10 +1194,8 @@ class NativeHomeAssistant(JobGroup):
         """Return Core's CPU and memory use."""
         status = await self.agent.status()
         if not status.running or status.pid is None:
-            raise DockerError("Home Assistant Core is not running")
-        if (result := await process_stats(status.pid, one_shot=one_shot)) is None:
-            raise DockerError("Home Assistant Core is not running")
-        return result
+            raise DockerContainerNotRunningError(name=self.name)
+        return await process_stats(status.pid, name=self.name, one_shot=one_shot)
 
     def __getattr__(self, name: str) -> Any:
         """Fail loudly on DockerInterface members not provided natively."""

@@ -5,6 +5,10 @@ the physical footprint (what Activity Monitor shows), CPU the user and system
 time. The Supervisor runs as the user, so for a root-owned app (OTBR) macOS
 refuses those reads; then /bin/ps supplies the resident size and CPU time.
 Per-process network and disk counters don't exist on macOS and stay 0.
+
+Differences from Docker's cgroup numbers: CPU time of a child that exits
+between two samples is lost with it, so a windowed percentage can read low;
+and a root-owned tree counts resident size, not footprint.
 """
 
 from __future__ import annotations
@@ -12,17 +16,21 @@ from __future__ import annotations
 import asyncio
 import ctypes
 import ctypes.util
+from functools import cache
 import os
 import subprocess
+import time
 from typing import Any
 
 from ..docker.stats import DockerStats
+from ..exceptions import (
+    DockerContainerNotRunningError,
+    DockerError,
+    DockerStatsTimeoutError,
+)
 
 _SAMPLE_SECONDS = 1.0
 _RUSAGE_INFO_V2 = 2
-_HOST_CPU_LOAD_INFO = 3
-_CPU_STATE_MAX = 4
-_CLK_TCK = 100  # macOS host CPU ticks per second
 
 
 class _RusageInfo(ctypes.Structure):
@@ -62,12 +70,18 @@ class _Timebase(ctypes.Structure):
     _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
 
 
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-_libc.mach_host_self.restype = ctypes.c_uint32
-# Each mach_host_self() call adds a port right; take one and keep it.
-_host_port = _libc.mach_host_self()
-_timebase = _Timebase()
-_libc.mach_timebase_info(ctypes.byref(_timebase))
+@cache
+def _libc() -> Any:
+    """Load libc on first use, so importing this module works anywhere."""
+    return ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+
+
+@cache
+def _timebase() -> tuple[int, int]:
+    """Return the Mach time units' numerator and denominator (to nanoseconds)."""
+    timebase = _Timebase()
+    _libc().mach_timebase_info(ctypes.byref(timebase))
+    return timebase.numer, timebase.denom
 
 
 def _ps_table() -> dict[int, tuple[int, int, int]]:
@@ -117,23 +131,22 @@ def _tree(table: dict[int, tuple[int, int, int]], root: int) -> list[int]:
 def _rusage(pid: int) -> tuple[int, int] | None:
     """Return (footprint bytes, CPU nanoseconds), or None if macOS refuses."""
     buffer = ctypes.create_string_buffer(_RUSAGE_BUFFER_SIZE)
-    if _libc.proc_pid_rusage(pid, _RUSAGE_INFO_V2, buffer) != 0:
+    if _libc().proc_pid_rusage(pid, _RUSAGE_INFO_V2, buffer) != 0:
         return None
     info = _RusageInfo.from_buffer_copy(buffer)
-    ticks = info.ri_user_time + info.ri_system_time
-    return info.ri_phys_footprint, ticks * _timebase.numer // _timebase.denom
+    numer, denom = _timebase()
+    return info.ri_phys_footprint, (
+        (info.ri_user_time + info.ri_system_time) * numer // denom
+    )
 
 
 def _host_cpu_ns() -> int:
-    """Return the CPU time of all cores since boot, in nanoseconds."""
-    ticks = (ctypes.c_uint32 * _CPU_STATE_MAX)()
-    count = ctypes.c_uint32(_CPU_STATE_MAX)
-    result = _libc.host_statistics(
-        _host_port, _HOST_CPU_LOAD_INFO, ticks, ctypes.byref(count)
-    )
-    if result != 0:
-        raise OSError(f"host_statistics returned {result}")
-    return sum(ticks) * (1_000_000_000 // _CLK_TCK)
+    """Return the CPU time all cores had since boot, in nanoseconds.
+
+    Like the total in /proc/stat that Docker reports, busy or idle. The Mach
+    tick counters are 32-bit and wrap within weeks, so derive it from uptime.
+    """
+    return time.monotonic_ns() * (os.cpu_count() or 1)
 
 
 def _memory_total() -> int:
@@ -180,20 +193,25 @@ def _docker_shape(
     return stats
 
 
-async def process_stats(pid: int, *, one_shot: bool = False) -> DockerStats | None:
-    """Return the stats of a process tree, or None if the pid is gone.
+async def process_stats(pid: int, *, name: str, one_shot: bool = False) -> DockerStats:
+    """Return the stats of the process tree of service name.
 
     Without one_shot, two samples a second apart give a CPU percentage, as
     Docker's windowed stats do.
     """
     loop = asyncio.get_running_loop()
-    first = await loop.run_in_executor(None, _sample, pid)
-    if first is None:
-        return None
-    if one_shot:
-        return DockerStats(_docker_shape(first, None))
-    await asyncio.sleep(_SAMPLE_SECONDS)
-    second = await loop.run_in_executor(None, _sample, pid)
+    try:
+        first = await loop.run_in_executor(None, _sample, pid)
+        if first is None:
+            raise DockerContainerNotRunningError(name=name)
+        if one_shot:
+            return DockerStats(_docker_shape(first, None))
+        await asyncio.sleep(_SAMPLE_SECONDS)
+        second = await loop.run_in_executor(None, _sample, pid)
+    except subprocess.TimeoutExpired as err:
+        raise DockerStatsTimeoutError(name=name) from err
+    except (OSError, subprocess.SubprocessError, ValueError) as err:
+        raise DockerError(f"Can't read the processes of {name}: {err}") from err
     if second is None:
-        return None
+        raise DockerContainerNotRunningError(name=name)
     return DockerStats(_docker_shape(second, first))

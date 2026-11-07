@@ -75,9 +75,7 @@ class NativeSupervisorInstance:
 
     async def stats(self, *, one_shot: bool = False) -> DockerStats:
         """Return the Supervisor's own CPU and memory use."""
-        if (result := await process_stats(os.getpid(), one_shot=one_shot)) is None:
-            raise DockerError("Can't read the Supervisor's own process")
-        return result
+        return await process_stats(os.getpid(), name=self.name, one_shot=one_shot)
 
     async def install(self, *args: Any, **kwargs: Any) -> None:
         """Self-update is not implemented yet on a native host."""

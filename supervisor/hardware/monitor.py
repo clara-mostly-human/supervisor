@@ -12,7 +12,7 @@ from ..const import ATTR_TYPE, BusEvent
 from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HardwareNotFound, HomeAssistantWSError
 from ..native import IS_MACOS
-from ..native.hardware import serial_nodes
+from ..native.hardware import serial_identity
 from ..resolution.const import UnhealthyReason
 from .const import HardwareAction, UdevKernelAction
 from .data import Device
@@ -32,6 +32,7 @@ class HwMonitor(CoreSysAttributes):
         self.monitor: pyudev.Monitor | None = None
         self.observer: pyudev.MonitorObserver | None = None
         self._native_task: asyncio.Task | None = None
+        self._native_seen: frozenset[tuple[str, int]] | None = None
 
     async def load(self) -> None:
         """Start hardware monitor."""
@@ -152,16 +153,20 @@ class HwMonitor(CoreSysAttributes):
                 _LOGGER.warning("Can't refresh the serial devices: %s", err)
 
     async def _native_refresh(self) -> None:
-        """Reload the devices if any serial device came, went or moved port."""
-        present = await self.sys_run_in_executor(serial_nodes)
+        """Reload the devices if a serial device came, went, moved or was swapped."""
+        identity = await self.sys_run_in_executor(serial_identity)
+        previous, self._native_seen = self._native_seen, identity
+        present = {name for name, _ in identity}
         known = {device.name for device in self.sys_hardware.devices}
-        if present == known:
+        if present == known and previous in (None, identity):
             return
         await self.sys_hardware.load_devices()
         current = {device.name: device for device in self.sys_hardware.devices}
         for name in sorted(known - current.keys()):
             _LOGGER.info("Detecting %s hardware /dev/%s", HardwareAction.REMOVE, name)
-        added = sorted(current.keys() - known)
+        # A different dongle in the same port gets a new device number
+        swapped = {name for name, _ in identity - (previous or identity)} & known
+        added = sorted((current.keys() - known) | (swapped & current.keys()))
         for name in added:
             device = current[name]
             _LOGGER.info(

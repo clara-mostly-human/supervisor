@@ -10,6 +10,7 @@ folder instead.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from pathlib import Path
 import plistlib
@@ -26,6 +27,7 @@ _IGNORED_SERIAL = ("cu.Bluetooth-Incoming-Port", "cu.debug-console")
 # udev keeps these characters in by-id names and replaces the rest
 _RE_UNSAFE = re.compile(r"[^A-Za-z0-9#+\-.:=@_]")
 _LINK_TMP_SUFFIX = ".supervisor-new"
+_NAME_MAX = 255 - len(_LINK_TMP_SUFFIX)
 # Inside the Supervisor's data folder, mirroring Linux's /dev/serial/by-id
 NATIVE_BY_ID = Path("dev", "serial", "by-id")
 
@@ -112,55 +114,89 @@ def _attributes(node: Path, usb: dict[str, Any] | None) -> tuple[dict, str | Non
     # Without a serial number two identical dongles can't be told apart.
     if not serial:
         return attributes, None
-    return attributes, f"usb-{attributes['ID_SERIAL']}-if{interface:02x}-port0"
+    return attributes, _fit(f"usb-{attributes['ID_SERIAL']}-if{interface:02x}-port0")
 
 
-def sync_links(links_dir: Path, wanted: dict[str, Path]) -> None:
-    """Make links_dir hold exactly the wanted name -> device links."""
+def _fit(name: str) -> str:
+    """Shorten a link name past the file name limit, keeping it unique."""
+    if len(name.encode()) <= _NAME_MAX:
+        return name
+    digest = hashlib.sha256(name.encode()).hexdigest()[:16]
+    return f"{name.encode()[: _NAME_MAX - 17].decode(errors='ignore')}-{digest}"
+
+
+def sync_links(links_dir: Path, wanted: dict[str, Path]) -> set[str]:
+    """Make links_dir hold the wanted name -> device links; return those in place.
+
+    Each link is handled on its own, so one that can't be written doesn't cost
+    the others theirs.
+    """
     links_dir.mkdir(parents=True, exist_ok=True)
     for entry in links_dir.iterdir():
         if entry.name not in wanted and entry.is_symlink():
-            entry.unlink()
+            try:
+                entry.unlink()
+            except OSError as err:
+                _LOGGER.warning("Can't remove the stale link %s: %s", entry, err)
+    in_place = set()
     for name, target in wanted.items():
         link = links_dir / name
-        if link.is_symlink() and link.readlink() == target:
+        try:
+            if not (link.is_symlink() and link.readlink() == target):
+                tmp = links_dir / f"{name}{_LINK_TMP_SUFFIX}"
+                tmp.unlink(missing_ok=True)
+                tmp.symlink_to(target)
+                tmp.replace(link)
+        except OSError as err:
+            _LOGGER.warning("Can't update the by-id link %s: %s", link, err)
             continue
-        tmp = links_dir / f"{name}{_LINK_TMP_SUFFIX}"
-        tmp.unlink(missing_ok=True)
-        tmp.symlink_to(target)
-        tmp.replace(link)
+        in_place.add(name)
+    return in_place
+
+
+def _usb_attributes(nodes: list[Path]) -> dict[Path, tuple[dict, str | None]]:
+    """Return each port's attributes and by-id name; never raises."""
+    try:
+        usb = _usb_serial_info() if nodes else {}
+    except Exception as err:  # pylint: disable=broad-except
+        _LOGGER.warning("Can't read USB details from IOKit: %s", err)
+        usb = {}
+    named: dict[Path, tuple[dict, str | None]] = {}
+    for node in nodes:
+        try:
+            named[node] = _attributes(node, usb.get(str(node)))
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Can't read the USB details of %s: %s", node, err)
+            named[node] = _attributes(node, None)
+    return named
 
 
 def list_devices(links_dir: Path | None = None) -> list[Device]:
-    """Return the host's serial devices, keeping their by-id links in links_dir."""
-    nodes = [Path("/dev", name) for name in sorted(serial_nodes())]
-    try:
-        usb = _usb_serial_info() if nodes else {}
-    except (OSError, subprocess.SubprocessError, plistlib.InvalidFileException) as err:
-        _LOGGER.warning("Can't read USB details from IOKit: %s", err)
-        usb = {}
+    """Return the host's serial devices, keeping their by-id links in links_dir.
 
-    named: dict[Path, tuple[dict, str | None]] = {
-        node: _attributes(node, usb.get(str(node))) for node in nodes
-    }
+    The ports are listed even if IOKit or the links fail: apps' device options
+    are validated against this list, so a missing port stops an app starting.
+    """
+    nodes = [Path("/dev", name) for name in sorted(serial_nodes())]
+    named = _usb_attributes(nodes)
     names = [name for _, name in named.values() if name]
     wanted = {
         name: node
         for node, (_, name) in named.items()
         if name and names.count(name) == 1
     }
+    in_place: set[str] = set()
     if links_dir is not None:
         try:
-            sync_links(links_dir, wanted)
+            in_place = sync_links(links_dir, wanted)
         except OSError as err:
             _LOGGER.warning("Can't update the by-id links in %s: %s", links_dir, err)
-            links_dir = None
 
     devices: list[Device] = []
     for node, (attributes, name) in named.items():
         links = (
             [links_dir / name]
-            if links_dir is not None and name and name in wanted
+            if links_dir is not None and name is not None and name in in_place
             else []
         )
         devices.append(
@@ -176,6 +212,17 @@ def list_devices(links_dir: Path | None = None) -> list[Device]:
             )
         )
     return devices
+
+
+def serial_identity() -> frozenset[tuple[str, int]]:
+    """Return each serial port's name and device number, to notice a swap."""
+    identity = set()
+    for name in serial_nodes():
+        try:
+            identity.add((name, Path("/dev", name).stat().st_rdev))
+        except OSError:
+            continue
+    return frozenset(identity)
 
 
 def boot_time() -> int | None:
