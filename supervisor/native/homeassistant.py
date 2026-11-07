@@ -51,11 +51,13 @@ from ..docker.const import (
 )
 from ..docker.manager import CommandReturn
 from ..docker.monitor import DockerContainerStateEvent
+from ..docker.stats import DockerStats
 from ..exceptions import DockerError, HomeAssistantAPIError
 from ..homeassistant.const import LANDINGPAGE
 from ..jobs.job_group import JobGroup
 from .docker import LOCALHOST
 from .launchd import LaunchAgent, LaunchdError
+from .stats import process_stats
 
 if TYPE_CHECKING:
     from ..coresys import CoreSys
@@ -1184,9 +1186,14 @@ class NativeHomeAssistant(JobGroup):
 
         return await self.sys_run_in_executor(_tail)
 
-    async def stats(self, *, one_shot: bool = False) -> Any:
-        """Not implemented yet natively."""
-        raise DockerError("Core stats are not available on a native host yet")
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
+        """Return Core's CPU and memory use."""
+        status = await self.agent.status()
+        if not status.running or status.pid is None:
+            raise DockerError("Home Assistant Core is not running")
+        if (result := await process_stats(status.pid, one_shot=one_shot)) is None:
+            raise DockerError("Home Assistant Core is not running")
+        return result
 
     def __getattr__(self, name: str) -> Any:
         """Fail loudly on DockerInterface members not provided natively."""

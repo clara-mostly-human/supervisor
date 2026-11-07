@@ -7,14 +7,17 @@ image, IP address and mounts. Natively it is a launchd service on the host.
 from __future__ import annotations
 
 from ipaddress import IPv4Address
+import os
 from typing import TYPE_CHECKING, Any
 
 from awesomeversion import AwesomeVersion
 
 from ..const import SUPERVISOR_VERSION, CpuArch
 from ..docker.const import ContainerState
+from ..docker.stats import DockerStats
 from ..exceptions import DockerError
 from .docker import LOCALHOST
+from .stats import process_stats
 
 if TYPE_CHECKING:
     from ..coresys import CoreSys
@@ -70,9 +73,11 @@ class NativeSupervisorInstance:
         """Return no logs; they are in the host log, not a container."""
         return []
 
-    async def stats(self, *args: Any, **kwargs: Any) -> Any:
-        """Not implemented yet on a native host."""
-        raise DockerError("Supervisor stats are not available on a native host")
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
+        """Return the Supervisor's own CPU and memory use."""
+        if (result := await process_stats(os.getpid(), one_shot=one_shot)) is None:
+            raise DockerError("Can't read the Supervisor's own process")
+        return result
 
     async def install(self, *args: Any, **kwargs: Any) -> None:
         """Self-update is not implemented yet on a native host."""

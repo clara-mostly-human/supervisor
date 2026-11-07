@@ -48,12 +48,14 @@ from ..apps.const import MappingType
 from ..const import AppBoot, BusEvent
 from ..docker.const import ENV_TIME, ENV_TOKEN, ENV_TOKEN_OLD, ContainerState
 from ..docker.monitor import DockerContainerStateEvent
+from ..docker.stats import DockerStats
 from ..exceptions import DockerError
 from ..jobs.job_group import JobGroup
 from . import NATIVE_RECIPE as RECIPE, helper
 from .docker import LOCALHOST
 from .homeassistant import _launchd_prefix, _python, _run, api_address
 from .launchd import BOOTOUT_TIMEOUT, LaunchAgent, LaunchdError, ServiceStatus
+from .stats import process_stats
 
 if TYPE_CHECKING:
     from ..apps.app import App
@@ -626,9 +628,19 @@ class NativeApp(JobGroup):
 
         return await self.sys_run_in_executor(_tail)
 
-    async def stats(self, *, one_shot: bool = False) -> Any:
-        """Not implemented yet natively."""
-        raise DockerError("App stats are not available on a native host yet")
+    async def stats(self, *, one_shot: bool = False) -> DockerStats:
+        """Return the app's CPU and memory use."""
+        try:
+            status = await self._service.status()
+        except helper.HelperError as err:
+            raise DockerError(
+                f"Can't read the state of app {self.app.slug}: {err}"
+            ) from err
+        if not status.running or status.pid is None:
+            raise DockerError(f"App {self.app.slug} is not running")
+        if (result := await process_stats(status.pid, one_shot=one_shot)) is None:
+            raise DockerError(f"App {self.app.slug} is not running")
+        return result
 
     async def write_stdin(self, data: bytes) -> None:
         """Native apps have no stdin channel."""
