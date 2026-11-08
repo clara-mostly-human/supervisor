@@ -32,6 +32,75 @@ _NAME_MAX = 255 - len(_LINK_TMP_SUFFIX)
 NATIVE_BY_ID = Path("dev", "serial", "by-id")
 
 
+def by_id_link_name(path: Path) -> str | None:
+    """Return the link name if path is a serial by-id link, wherever it lives.
+
+    Linux keeps the links in /dev/serial/by-id, the Supervisor on macOS in its
+    data folder (<data>/dev/serial/by-id), so a path saved on another host or
+    under another data folder names its device by the link name alone.
+    """
+    if len(path.parts) >= 5 and path.parts[-4:-1] == ("dev", "serial", "by-id"):
+        return path.name
+    return None
+
+
+# USB serial numbers many devices share, so they don't tell a dongle apart.
+# Mirrors serialx's NON_UNIQUE_SERIAL_NUMBERS (serialx 1.15.1, Core 2026.11.0),
+# which Core checks before following a port by its link name.
+_FTDI = {
+    "A50285BI", "A5XK3RJT", "A5XK3RJJ", "A5069RR4", "FTB6SPL3", "A601CKQK",
+    "A400DE3U", "00000000", "0000000", "DUT", "12345678", "ZIGATE+", "001",
+}  # fmt: skip
+_GENERIC_SERIALS = frozenset(
+    {*_FTDI, *(serial + "A" for serial in _FTDI)}
+    | {
+        "0001",
+        "1234",
+        "00000000001A",
+        "0",
+        "123456",
+        "0000000000",
+        "EEEEEEEEEEEEEEEE",
+        "HIDFG",
+        "0123456789ABCDEF",
+        "12345678-9012-3456-7890-123456789012",
+        "301",
+        "304",
+        "0123456789",
+        "000000000000",
+        "00000001",
+        "123456789",
+        "000000000001",
+        "1234567890",
+        "000000000000000000000000",
+    }  # fmt: skip
+)
+
+
+def has_unique_serial(device: Device) -> bool:
+    """Return whether a device's USB serial number tells it apart from its twins."""
+    serial = device.attributes.get("ID_SERIAL_SHORT")
+    return bool(serial and serial.strip()) and serial not in _GENERIC_SERIALS
+
+
+def device_by_link_name(devices: list[Device], path: Path) -> Device | None:
+    """Return the one device whose by-id link has the name a missing path has.
+
+    Only a device with a unique serial number: a generic one would match a
+    different dongle of the same model.
+    """
+    if (name := by_id_link_name(path)) is None:
+        return None
+    found = [
+        device
+        for device in devices
+        if device.by_id is not None
+        and device.by_id.name == name
+        and has_unique_serial(device)
+    ]
+    return found[0] if len(found) == 1 else None
+
+
 def serial_nodes() -> set[str]:
     """Return the names of the serial devices present right now (cheap)."""
     return {

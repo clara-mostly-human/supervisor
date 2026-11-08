@@ -12,6 +12,8 @@ from ..coresys import CoreSys, CoreSysAttributes
 from ..exceptions import HardwareNotFound
 from ..hardware.const import UdevSubsystem
 from ..hardware.data import Device
+from ..native import IS_MACOS
+from ..native.hardware import device_by_link_name
 from ..validate import network_port
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
@@ -192,9 +194,22 @@ class AppOptions(CoreSysAttributes):
             try:
                 device = self.sys_hardware.get_by_path(Path(value))
             except HardwareNotFound:
-                raise vol.Invalid(
-                    f"Device '{value}' does not exist in {self._name} ({self._slug})"
-                ) from None
+                # macOS: a by-id link saved under another data folder or on
+                # Linux names the same dongle as this host's link of that name
+                if (
+                    not IS_MACOS
+                    or (
+                        found := device_by_link_name(
+                            self.sys_hardware.devices, Path(value)
+                        )
+                    )
+                    is None
+                ):
+                    raise vol.Invalid(
+                        f"Device '{value}' does not exist in {self._name} ({self._slug})"
+                    ) from None
+                device = found
+                value = device.by_id.as_posix()  # type: ignore[union-attr]
 
             # Have filter
             if match.group("filter"):

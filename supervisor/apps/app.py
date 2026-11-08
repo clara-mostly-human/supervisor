@@ -100,6 +100,7 @@ from ..jobs.const import JobConcurrency, JobThrottle
 from ..jobs.decorator import Job
 from ..native import IS_MACOS
 from ..native.app import NativeApp
+from ..native.hardware import device_by_link_name
 from ..resolution.const import ContextType, IssueType, SuggestionType
 from ..resolution.data import Issue
 from ..store.app import AppStore
@@ -149,6 +150,19 @@ _MAP_APP_STATE = {
     AppState.ERROR: AppState.STOPPED,
     AppState.UNKNOWN: AppState.STOPPED,
 }
+
+
+def _replace_strings(value: Any, replacements: dict[str, str]) -> Any:
+    """Return value with each string in replacements swapped, however nested."""
+    if isinstance(value, str):
+        return replacements.get(value, value)
+    if isinstance(value, list):
+        return [_replace_strings(item, replacements) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_strings(item, replacements) for key, item in value.items()
+        }
+    return value
 
 
 class App(AppModel):
@@ -1186,6 +1200,31 @@ class App(AppModel):
             )
         return out
 
+    async def _native_adopt_device_links(self) -> None:
+        """Point restored device options at this host's by-id links.
+
+        On macOS a by-id path names the Supervisor's data folder. A restored
+        one that isn't here is matched by link name, as option validation
+        does, and swapped in the stored options; nothing else in them changes.
+        """
+        stored = self.persist.get(ATTR_OPTIONS) or {}
+        moves: dict[str, str] = {}
+        for path in self.schema.extract_device_paths(stored):
+            if self.sys_hardware.exists_device_node(path):
+                continue
+            device = device_by_link_name(self.sys_hardware.devices, path)
+            if device is not None and device.by_id is not None:
+                moves[str(path)] = device.by_id.as_posix()
+        if not moves:
+            return
+        _LOGGER.info(
+            "App %s: device options now name this host's by-id links: %s",
+            self.slug,
+            ", ".join(f"{old} -> {new}" for old, new in sorted(moves.items())),
+        )
+        self.options = _replace_strings(stored, moves)
+        await self.save_persist()
+
     async def write_pulse(self) -> None:
         """Write asound config to file and return True on success."""
         pulse_config = self.sys_plugins.audio.pulse_client(
@@ -1732,6 +1771,8 @@ class App(AppModel):
             await self.sys_apps.data.restore(
                 self.slug, data[ATTR_USER], data[ATTR_SYSTEM], restore_image
             )
+            if IS_MACOS:
+                await self._native_adopt_device_links()
 
             # Stop it first if its running
             if await self.instance.is_running():
