@@ -83,6 +83,50 @@ HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE = [
 RUN_SUPERVISOR_CORE = PurePath("core")
 
 
+def _restore_filter(member: tarfile.TarInfo, dest_path: str) -> tarfile.TarInfo | None:
+    """Apply the tar filter, skipping a config folder that was saved as a link.
+
+    A config folder reached through a symlink (macOS keeps Core's old config
+    folder) used to be saved as that link, `data` -> its absolute path, ahead
+    of its files. Following it would put every file outside the destination;
+    the files themselves restore into a plain `data` folder.
+    """
+    if member.issym() and member.name.removeprefix("./").rstrip("/") == "data":
+        return None
+    return tarfile.tar_filter(member, dest_path)
+
+
+def _restore_target(path: Path, supervisor_data: Path) -> Path:
+    """Return the folder a restore empties and fills: the config folder or its target.
+
+    A restore empties a link's target, so refuse one that can't be a Core
+    config folder: the home folder or above, a folder holding the Supervisor's
+    data, or a non-empty folder without configuration.yaml or .HA_VERSION.
+    Must be run in executor.
+    """
+    if not path.is_symlink():
+        return path
+    real = path.resolve()
+    home = Path.home().resolve()
+    if (
+        not real.is_dir()
+        or real == home
+        or real in home.parents
+        or supervisor_data.resolve().is_relative_to(real)
+        or (
+            any(real.iterdir())
+            and not (real / "configuration.yaml").exists()
+            and not (real / ".HA_VERSION").exists()
+        )
+    ):
+        raise HomeAssistantError(
+            f"{path} links to {real}, which isn't a Core config folder;"
+            " not restoring into it",
+            _LOGGER.error,
+        )
+    return real
+
+
 class HomeAssistant(FileConfiguration, CoreSysAttributes):
     """Home Assistant core object for handle it."""
 
@@ -493,6 +537,8 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
         # Backup data config folder
         def _write_tarfile(metadata: dict[str, Any]) -> None:
             """Write tarfile."""
+            # The folder itself, not a link to it, or a restore can't use it
+            config_folder = self.sys_config.path_homeassistant.resolve()
             with TemporaryDirectory(dir=self.sys_config.path_tmp) as temp:
                 temp_path = Path(temp)
 
@@ -513,7 +559,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                         # Backup data
                         atomic_contents_add(
                             backup,
-                            self.sys_config.path_homeassistant,
+                            config_folder,
                             file_filter=_is_excluded_by_filter,
                             arcname="data",
                         )
@@ -542,6 +588,10 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
 
             Returns: Home Assistant metadata
             """
+            # Replace what a link points at, as with a plain folder
+            config_folder = _restore_target(
+                self.sys_config.path_homeassistant, self.sys_config.path_supervisor
+            )
             with TemporaryDirectory(dir=self.sys_config.path_tmp) as temp:
                 temp_path = Path(temp)
                 temp_data = temp_path.joinpath("data")
@@ -554,7 +604,7 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                         # aborting restore of potentially crafted backups.
                         backup.extractall(
                             path=temp_path,
-                            filter="tar",
+                            filter=_restore_filter,
                         )
                 except (tarfile.FilterError, SecureTarError) as err:
                     raise BackupInvalidError(
@@ -572,17 +622,28 @@ class HomeAssistant(FileConfiguration, CoreSysAttributes):
                 _LOGGER.info("Restore Home Assistant Core config folder")
                 if exclude_database is True:
                     remove_folder_with_excludes(
-                        self.sys_config.path_homeassistant,
+                        config_folder,
                         excludes=HOMEASSISTANT_BACKUP_EXCLUDE_DATABASE,
                         tmp_dir=self.sys_config.path_tmp,
                     )
                 else:
-                    remove_folder(self.sys_config.path_homeassistant, content_only=True)
+                    remove_folder(config_folder, content_only=True)
+
+                # Copying into a link left behind would write wherever it points
+                if left := next(
+                    (item for item in config_folder.rglob("*") if item.is_symlink()),
+                    None,
+                ):
+                    raise HomeAssistantError(
+                        f"Can't empty {config_folder}: the link {left} is still"
+                        " there; not restoring into it",
+                        _LOGGER.error,
+                    )
 
                 try:
                     shutil.copytree(
                         temp_data,
-                        self.sys_config.path_homeassistant,
+                        config_folder,
                         symlinks=True,
                         dirs_exist_ok=True,
                     )
