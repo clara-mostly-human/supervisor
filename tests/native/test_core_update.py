@@ -682,6 +682,7 @@ async def test_run_passes_both_sockets_like_ha_os(tmp_path: Path, unix_socket: b
     hass.sys_homeassistant.api.supports_unix_socket = unix_socket
     hass.sys_homeassistant.path_run_supervisor = tmp_path / "os" / "supervisor" / "core"
     hass.sys_config.path_homeassistant = tmp_path / "config"
+    hass.sys_config.path_supervisor = tmp_path / "data"
     hass.path_logs = tmp_path / "logs"
     hass.sys_run_in_executor = lambda func, *args: loop.run_in_executor(
         None, func, *args
@@ -704,4 +705,8 @@ async def test_run_passes_both_sockets_like_ha_os(tmp_path: Path, unix_socket: b
         ),
     }
     assert sockets == (expected if unix_socket else dict.fromkeys(expected))
+    # Core's serial-by-id patch reads the Supervisor's by-id links from here
+    assert env["SUPERVISOR_SERIAL_BY_ID_DIR"] == str(
+        tmp_path / "data" / "dev" / "serial" / "by-id"
+    )
     hass.start.assert_awaited_once()

@@ -60,6 +60,7 @@ from ..exceptions import (
 from ..homeassistant.const import LANDINGPAGE
 from ..jobs.job_group import JobGroup
 from .docker import LOCALHOST
+from .hardware import NATIVE_BY_ID
 from .launchd import LaunchAgent, LaunchdError
 from .stats import process_stats
 
@@ -70,6 +71,9 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 HASS_NAME = "homeassistant"
 ENV_RESTORE_JOB_ID = "SUPERVISOR_RESTORE_JOB_ID"
+# Where the Supervisor keeps the /dev/serial/by-id links macOS has no udev for;
+# Core's carried serial-by-id patch names serial ports by them, as on Linux
+ENV_SERIAL_BY_ID_DIR = "SUPERVISOR_SERIAL_BY_ID_DIR"
 STOP_TIMEOUT = 240
 HUNG_STOP_TIMEOUT = 60
 POLL_SECONDS = 5
@@ -1011,6 +1015,7 @@ class NativeHomeAssistant(JobGroup):
             ENV_DUPLICATE_LOG_FILE: "1",
             "HOME": str(Path.home()),
             "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            ENV_SERIAL_BY_ID_DIR: str(self.sys_config.path_supervisor / NATIVE_BY_ID),
         }
         if restore_job_id:
             environment[ENV_RESTORE_JOB_ID] = restore_job_id
