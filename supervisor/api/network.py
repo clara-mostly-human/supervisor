@@ -76,6 +76,7 @@ from ..host.configuration import (
     ssid_to_str,
 )
 from ..host.const import AuthMethod, InterfaceType, WifiMode
+from ..native import IS_MACOS
 from .utils import api_process, api_validate
 
 _SCHEMA_IPV4_CONFIG = vol.Schema(
@@ -445,6 +446,11 @@ def accesspoint_struct(accesspoint: AccessPoint) -> dict[str, Any]:
 class APINetwork(CoreSysAttributes):
     """Handle REST API for network."""
 
+    async def _refresh_native(self) -> None:
+        """Read macOS's interfaces again; it sends no change signals here."""
+        if IS_MACOS:
+            await self.sys_host.network.update()
+
     def _get_interface(self, name: str) -> Interface:
         """Get Interface by name or default."""
         if name.lower() == "default":
@@ -464,6 +470,7 @@ class APINetwork(CoreSysAttributes):
     @api_process
     async def info_v1(self, _: web.Request) -> dict[str, Any]:
         """Return network information."""
+        await self._refresh_native()
         return {
             ATTR_INTERFACES: [
                 interface_struct_v1(interface)
@@ -482,6 +489,7 @@ class APINetwork(CoreSysAttributes):
     @api_process
     async def interface_info_v1(self, request: web.Request) -> dict[str, Any]:
         """Return network information for a interface."""
+        await self._refresh_native()
         interface = self._get_interface(request.match_info[ATTR_INTERFACE])
 
         return interface_struct_v1(interface)
@@ -492,6 +500,7 @@ class APINetwork(CoreSysAttributes):
         Unlike `_get_interface()`, this does not support the `default` alias
         (dropped in v2) and excludes VLAN interfaces (not shown in v2 for now).
         """
+        await self._refresh_native()
         try:
             resolved = await self.sys_host.network.get_with_config(name)
         except HostNetworkNotFound:
@@ -505,6 +514,7 @@ class APINetwork(CoreSysAttributes):
     @api_process
     async def info(self, _: web.Request) -> dict[str, Any]:
         """Return network information (v2)."""
+        await self._refresh_native()
         return {
             ATTR_INTERFACES: [
                 interface_struct(resolved)
