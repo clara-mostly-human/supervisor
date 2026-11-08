@@ -1,0 +1,51 @@
+--- a/homeassistant/components/bluetooth/__init__.py
++++ b/homeassistant/components/bluetooth/__init__.py
+@@ -373,8 +373,40 @@
+         if not device_entry.area_id and via_area_id:
+             kwargs["area_id"] = via_area_id
+         device_registry.async_update_device(device_entry.id, **kwargs)
++
++
++def _drain_corebluetooth_autoreleases() -> None:
++    """Give each advertisement on macOS an autorelease pool of its own.
+ 
++    bleak handles advertisements on the event loop thread. That thread has no pool
++    that ever drains, so what PyObjC autoreleases there stays for the life of the
++    process: about 1 GB in 9 hours. bleak is not in this package and is reinstalled
++    with this integration's requirements, so it is wrapped from here.
++    """
++    if platform.system() != "Darwin":
++        return
++    try:
++        import objc  # noqa: PLC0415
+ 
++        from bleak.backends.corebluetooth.CentralManagerDelegate import (  # noqa: PLC0415
++            CentralManagerDelegate,
++        )
++
++        original = CentralManagerDelegate.did_discover_peripheral
++    except (ImportError, AttributeError) as err:
++        _LOGGER.warning("Autorelease fix for CoreBluetooth not applied: %s", err)
++        return
++    if getattr(original, "drains_autoreleases", False):
++        return
++
++    def did_discover_peripheral(self: Any, *args: Any) -> None:
++        with objc.autorelease_pool():
++            original(self, *args)
++
++    did_discover_peripheral.drains_autoreleases = True  # type: ignore[attr-defined]
++    CentralManagerDelegate.did_discover_peripheral = did_discover_peripheral
++
++
+ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+     """Set up a config entry for a bluetooth scanner."""
+     if source_entry_id := entry.data.get(CONF_SOURCE_CONFIG_ENTRY_ID):
+@@ -425,6 +457,7 @@
+     # the scanner would start passive on hardware that can't do passive.
+     if mode is BluetoothScanningMode.AUTO and not details.get(ADAPTER_PASSIVE_SCAN):
+         mode = BluetoothScanningMode.ACTIVE
++    await hass.async_add_import_executor_job(_drain_corebluetooth_autoreleases)
+     scanner = HaScanner(mode, adapter, address)
+     entry.async_on_unload(scanner.async_setup())
+     if entry.title == address:

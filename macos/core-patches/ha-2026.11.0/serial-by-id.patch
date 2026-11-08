@@ -1,0 +1,130 @@
+--- a/homeassistant/components/usb/__init__.py
++++ b/homeassistant/components/usb/__init__.py
+@@ -37,6 +37,7 @@
+ from .models import SerialDevice, SerialPortConsumer, USBDevice
+ from .serial_proxy_stub import register_serialx_transport
+ from .utils import (
++    SERIAL_BY_ID_DIR,
+     has_unique_serial_number,
+     scan_serial_ports,
+     serial_path_udev_id,
+@@ -205,7 +206,7 @@
+ 
+ def get_serial_by_id(dev_path: str) -> str:
+     """Return a /dev/serial/by-id match for given device if available."""
+-    by_id = "/dev/serial/by-id"
++    by_id = SERIAL_BY_ID_DIR
+     if not os.path.isdir(by_id):
+         return dev_path
+ 
+--- a/homeassistant/components/usb/utils.py
++++ b/homeassistant/components/usb/utils.py
+@@ -1,8 +1,10 @@
+ """The USB Discovery integration."""
+ 
+ from collections.abc import Sequence
++import dataclasses
+ import fnmatch
+ import os
++import re
+ from urllib.parse import parse_qs, urlsplit
+ 
+ from serialx import SerialPortInfo, is_non_unique_serial, list_serial_ports
+@@ -12,7 +14,17 @@
+ 
+ from .models import SerialDevice, USBDevice
+ 
+-SERIAL_BY_ID_DIR = "/dev/serial/by-id/"
++# udev keeps these links in /dev on Linux. The native macOS Supervisor keeps the
++# same links in its data folder, since macOS has no udev, and says where.
++SERIAL_BY_ID_DIR = (
++    os.environ.get("SUPERVISOR_SERIAL_BY_ID_DIR", "/dev/serial/by-id").rstrip("/")
++    + "/"
++)
++# The Supervisor swaps a link in through a temporary name ending in this
++_BY_ID_TMP_SUFFIX = ".supervisor-new"
++# A by-id link saved elsewhere still names its device: /dev/serial/by-id/<name>
++# on Linux, <data>/dev/serial/by-id/<name> under any macOS Supervisor data folder
++_RE_BY_ID_ELSEWHERE = re.compile(r"^/(?:.+/)?dev/serial/by-id/([^/]+)$")
+ 
+ 
+ def usb_device_from_port(port: SerialPortInfo) -> USBDevice:
+@@ -54,9 +66,33 @@
+     return serial_device_from_port(port)
+ 
+ 
++def _serial_by_id_links() -> dict[str, str]:
++    """Return each by-id link by the device node it points at."""
++    try:
++        with os.scandir(SERIAL_BY_ID_DIR) as entries:
++            return {
++                os.path.realpath(entry.path): entry.path
++                for entry in entries
++                if entry.is_symlink() and not entry.name.endswith(_BY_ID_TMP_SUFFIX)
++            }
++    except OSError:
++        return {}
++
++
+ def scan_serial_ports() -> Sequence[USBDevice | SerialDevice]:
+     """Scan serial ports and return USB and other serial devices."""
+-    return [usb_serial_device_from_port(port) for port in list_serial_ports()]
++    ports = [usb_serial_device_from_port(port) for port in list_serial_ports()]
++    # On Linux the port list already names ports by their by-id links. Where the
++    # platform reports the device node itself (macOS), name it by its link too,
++    # so a configured port survives the device moving to another USB port.
++    links = _serial_by_id_links()
++    return [
++        dataclasses.replace(port, device=link)
++        if port.device == port.resolved_device
++        and (link := links.get(os.path.realpath(port.device))) is not None
++        else port
++        for port in ports
++    ]
+ 
+ 
+ def has_unique_serial_number(port: SerialDevice) -> bool:
+@@ -72,6 +108,10 @@
+     if path.startswith(SERIAL_BY_ID_DIR):
+         return path.removeprefix(SERIAL_BY_ID_DIR)
+ 
++    # Saved on another host or under another Supervisor data folder (a restore)
++    if (match := _RE_BY_ID_ELSEWHERE.match(path)) is not None:
++        return match.group(1)
++
+     query = parse_qs(urlsplit(path).query)
+     if "port_udev_id" in query:
+         return query["port_udev_id"][0]
+@@ -83,8 +123,9 @@
+     """Get USB device info from a device path."""
+ 
+     device_path_real = os.path.realpath(device_path)
++    devices = scan_serial_ports()
+ 
+-    for device in scan_serial_ports():
++    for device in devices:
+         # Skip non-USB serial devices
+         if not isinstance(device, USBDevice):
+             continue
+@@ -92,7 +133,20 @@
+         if os.path.realpath(device.device) == device_path_real:
+             return device
+ 
+-    return None
++    # A by-id link that isn't here, saved on another host or under another
++    # Supervisor data folder (a restore), is the device with that link name
++    if os.path.lexists(device_path):
++        return None
++    if (udev_id := serial_path_udev_id(device_path)) is None:
++        return None
++    found = [
++        device
++        for device in devices
++        if isinstance(device, USBDevice)
++        and has_unique_serial_number(device)
++        and serial_path_udev_id(device.device) == udev_id
++    ]
++    return found[0] if len(found) == 1 else None
+ 
+ 
+ def _fnmatch_lower(name: str | None, pattern: str) -> bool:

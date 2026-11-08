@@ -1,0 +1,76 @@
+--- a/homeassistant/runner.py
++++ b/homeassistant/runner.py
+@@ -7,6 +7,7 @@
+ from datetime import datetime
+ import errno
+ import fcntl
++import gc
+ from io import TextIOWrapper
+ import json
+ import logging
+@@ -20,6 +21,7 @@
+ import traceback
+ from typing import Any
+ 
++import orjson
+ import packaging.tags
+ 
+ from . import bootstrap
+@@ -286,6 +288,34 @@
+         finally:
+             asyncio.set_event_loop(None)
+             loop.close()
++            _drop_cached_json_fragments()
++
++
++def _drop_cached_json_fragments() -> None:
++    """Drop the orjson Fragments that Home Assistant objects cache.
++
++    orjson.Fragment does not keep a reference to its type, so a Fragment that
++    is still alive when the interpreter tears down its modules can outlive the
++    type and crash the process when it is freed. Home Assistant caches
++    Fragments on its own objects (propcache ``_cache`` dicts and
++    ``functools.cached_property``), and those objects can stay reachable until
++    then. Drop the cached Fragments while every module is still loaded.
++    """
++    fragment = orjson.Fragment
++    for obj in gc.get_objects():
++        module = getattr(type(obj), "__module__", None)
++        if not isinstance(module, str) or not module.startswith(
++            ("homeassistant.", "custom_components.")
++        ):
++            continue
++        try:
++            stores = (getattr(obj, "_cache", None), getattr(obj, "__dict__", None))
++        except Exception:  # noqa: BLE001
++            continue
++        for store in stores:
++            if type(store) is dict:
++                for key in [k for k, v in store.items() if type(v) is fragment]:
++                    del store[key]
+ 
+ 
+ def _cancel_all_tasks_with_timeout(
+--- a/homeassistant/components/bluetooth/__init__.py
++++ b/homeassistant/components/bluetooth/__init__.py
+@@ -444,8 +444,20 @@
+         ) from err
+     entry.async_on_unload(entry.add_update_listener(async_update_listener))
+     entry.async_on_unload(scanner.async_stop)
++
++    async def _async_stop_scanner(event: Event) -> None:
++        """Stop the scanner when Home Assistant stops."""
++        # Config entries are not unloaded at shutdown. Without this the
++        # scanner keeps running while the interpreter exits, and on macOS
++        # CoreBluetooth then delivers advertisements into a finalizing
++        # interpreter, which aborts the process.
++        await scanner.async_stop()
+ 
++    entry.async_on_unload(
++        hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _async_stop_scanner)
++    )
+ 
++
+ async def async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
+     """Handle options update."""
+     await hass.config_entries.async_reload(entry.entry_id)
