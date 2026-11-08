@@ -20,6 +20,8 @@ from .data import Device
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 NATIVE_POLL_SECONDS = 5
+# An incomplete listing is redone after 5 s, then 10, 20 ... at most this
+NATIVE_RETRY_MAX_SECONDS = 300
 
 
 class HwMonitor(CoreSysAttributes):
@@ -33,6 +35,8 @@ class HwMonitor(CoreSysAttributes):
         self.observer: pyudev.MonitorObserver | None = None
         self._native_task: asyncio.Task | None = None
         self._native_seen: frozenset[tuple[str, int]] | None = None
+        self._native_retry_at: float = 0.0
+        self._native_retry_delay: float = NATIVE_POLL_SECONDS
 
     async def load(self) -> None:
         """Start hardware monitor."""
@@ -153,14 +157,27 @@ class HwMonitor(CoreSysAttributes):
                 _LOGGER.warning("Can't refresh the serial devices: %s", err)
 
     async def _native_refresh(self) -> None:
-        """Reload the devices if a serial device came, went, moved or was swapped."""
+        """Reload the devices if a serial device came, went, moved or was swapped.
+
+        A listing without IOKit's USB details is tried again, less often each
+        time it fails; Core is asked to scan once the details are back.
+        """
         identity = await self.sys_run_in_executor(serial_identity)
         previous, self._native_seen = self._native_seen, identity
         present = {name for name, _ in identity}
         known = {device.name for device in self.sys_hardware.devices}
+        was_complete = self.sys_hardware.native_complete
         if present == known and previous in (None, identity):
-            return
+            if was_complete or self.sys_loop.time() < self._native_retry_at:
+                return
         await self.sys_hardware.load_devices()
+        if self.sys_hardware.native_complete:
+            self._native_retry_delay = NATIVE_POLL_SECONDS
+        else:
+            self._native_retry_at = self.sys_loop.time() + self._native_retry_delay
+            self._native_retry_delay = min(
+                self._native_retry_delay * 2, NATIVE_RETRY_MAX_SECONDS
+            )
         current = {device.name: device for device in self.sys_hardware.devices}
         for name in sorted(known - current.keys()):
             _LOGGER.info("Detecting %s hardware /dev/%s", HardwareAction.REMOVE, name)
@@ -175,7 +192,7 @@ class HwMonitor(CoreSysAttributes):
                 device.path,
                 device.by_id,
             )
-        if added:
+        if added or (not was_complete and self.sys_hardware.native_complete):
             await self._native_ask_core_to_scan()
 
     async def _native_ask_core_to_scan(self) -> None:

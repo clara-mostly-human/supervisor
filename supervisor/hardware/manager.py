@@ -56,6 +56,10 @@ class HardwareManager(CoreSysAttributes):
         self.coresys: CoreSys = coresys
         self._devices: dict[str, Device] = {}
         self._udev: pyudev.Context = udev
+        # macOS: False while the last listing lacked USB details from IOKit
+        self.native_complete: bool = True
+        # None until the first listing, which starts from the links on disk
+        self._native_linked: dict[Path, tuple[int, str]] | None = None
 
         self._monitor: HwMonitor = HwMonitor(coresys, udev)
         self._helper: HwHelper = HwHelper(coresys)
@@ -148,7 +152,14 @@ class HardwareManager(CoreSysAttributes):
 
         if IS_MACOS:
             links = self.sys_config.path_supervisor / NATIVE_BY_ID
-            return {device.name: device for device in native_devices(links)}
+            listing = native_devices(
+                links, self._native_linked, warn=self.native_complete
+            )
+            if listing.complete and not self.native_complete:
+                _LOGGER.info("USB details from IOKit are complete again")
+            self.native_complete = listing.complete
+            self._native_linked = listing.linked
+            return {device.name: device for device in listing.devices}
 
         # Extract all devices
         for device in self.udev.list_devices():

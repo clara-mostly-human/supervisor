@@ -2,14 +2,17 @@
 
 from pathlib import Path
 import plistlib
+import subprocess
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import voluptuous as vol
 
+from supervisor.apps.options import AppOptions, UiOptions
 from supervisor.hardware import manager as hw_manager
 from supervisor.hardware.data import Device
 from supervisor.hardware.manager import HardwareManager
-from supervisor.hardware.monitor import HwMonitor
+from supervisor.hardware.monitor import NATIVE_POLL_SECONDS, HwMonitor
 from supervisor.native import hardware
 
 SERIAL = "5a1e0001c0ffee00d00d0000beef0001"
@@ -56,10 +59,20 @@ def test_import_devices_returns_the_native_devices(tmp_path: Path) -> None:
     devices = [_device("cu.usbserial-1120"), _device("cu.usbserial-3110")]
     manager = MagicMock()
     manager.sys_config.path_supervisor = tmp_path
-    with patch.object(hw_manager, "native_devices", return_value=devices) as found:
+    manager.native_complete = True
+    manager._native_linked = before = {}
+    with patch.object(
+        hw_manager,
+        "native_devices",
+        return_value=hardware.Listing(devices, False, {Path("/dev/x"): (1, "l")}),
+    ) as found:
         result = HardwareManager._import_devices(manager)  # noqa: SLF001
     assert result == {device.name: device for device in devices}
-    found.assert_called_once_with(tmp_path / "dev" / "serial" / "by-id")
+    found.assert_called_once_with(
+        tmp_path / "dev" / "serial" / "by-id", before, warn=True
+    )
+    assert manager.native_complete is False
+    assert manager._native_linked == {Path("/dev/x"): (1, "l")}
 
 
 def test_usb_info_takes_the_dongle_not_the_hub() -> None:
@@ -131,7 +144,9 @@ def test_list_devices_reports_the_link_as_by_id(tmp_path: Path) -> None:
         patch.object(hardware, "serial_nodes", return_value={"cu.usbserial-3110"}),
         patch.object(hardware.subprocess, "run", return_value=run),
     ):
-        (device,) = hardware.list_devices(links)
+        listing = hardware.list_devices(links)
+    (device,) = listing.devices
+    assert listing.complete
     assert device.by_id == links / BY_ID
     assert device.links == [links / BY_ID]
 
@@ -141,7 +156,7 @@ def test_list_devices_reports_the_link_as_by_id(tmp_path: Path) -> None:
         patch.object(hardware, "_usb_serial_info", return_value=twice),
         patch.object(hardware, "_attributes", return_value=({"DEVNAME": "x"}, BY_ID)),
     ):
-        devices = hardware.list_devices(links)
+        devices = hardware.list_devices(links).devices
     assert [device.by_id for device in devices] == [None, None]
 
 
@@ -151,9 +166,142 @@ def test_ioreg_failure_still_lists_the_ports(tmp_path: Path) -> None:
         patch.object(hardware, "serial_nodes", return_value={"cu.usbserial-3110"}),
         patch.object(hardware.subprocess, "run", side_effect=OSError("no ioreg")),
     ):
-        (device,) = hardware.list_devices(tmp_path / "by-id")
+        listing = hardware.list_devices(tmp_path / "by-id")
+    (device,) = listing.devices
     assert device.name == "cu.usbserial-3110"
     assert device.by_id is None
+    assert not listing.complete
+
+
+NODE = "cu.usbserial-3110"
+
+
+def _listing(
+    links: Path,
+    linked: dict | None,
+    number: int,
+    **run: object,
+) -> hardware.Listing:
+    """List NODE (device number `number`) with ioreg doing `run`."""
+    if not run:
+        run = {"return_value": MagicMock(stdout=_ioreg(f"/dev/{NODE}"))}
+    with (
+        patch.object(hardware, "serial_nodes", return_value={NODE}),
+        patch.object(
+            hardware, "_device_numbers", return_value={Path("/dev", NODE): number}
+        ),
+        patch.object(hardware.subprocess, "run", **run),
+    ):
+        return hardware.list_devices(links, linked)
+
+
+IOKIT_FAILURES = [
+    pytest.param({"side_effect": subprocess.TimeoutExpired("ioreg", 15)}, id="timeout"),
+    pytest.param(
+        {"return_value": MagicMock(stdout=b"<plist><array><dict>")}, id="garbled"
+    ),
+]
+
+
+@pytest.mark.parametrize("failure", IOKIT_FAILURES)
+def test_ioreg_failure_keeps_the_links(tmp_path: Path, failure: dict) -> None:
+    """Test links survive a failed IOKit read, which would make all look stale.
+
+    Apps' device options name the links, so dropping them stops those apps.
+    """
+    links = tmp_path / "by-id"
+    good = _listing(links, None, 7)
+    assert good.complete
+    assert good.linked == {Path("/dev", NODE): (7, BY_ID)}
+    (links / "usb-unplugged-if00-port0").symlink_to("/dev/cu.gone")
+    before = sorted(links.iterdir())
+
+    for _ in range(2):  # and again, from the incomplete listing
+        listing = _listing(links, good.linked, 7, **failure)
+        (device,) = listing.devices
+        assert not listing.complete
+        assert device.by_id == links / BY_ID
+        assert listing.linked == good.linked
+        assert sorted(links.iterdir()) == before
+
+    # Back to normal: the stale link goes
+    assert _listing(links, listing.linked, 7).complete
+    assert not (links / "usb-unplugged-if00-port0").is_symlink()
+
+
+@pytest.mark.parametrize("failure", IOKIT_FAILURES)
+def test_another_dongle_in_the_port_during_an_outage_gets_no_link(
+    tmp_path: Path, failure: dict
+) -> None:
+    """Test a link goes once its port's device number changes.
+
+    A dongle moved into the port meanwhile would otherwise pass for the old
+    one. macOS may give it the same number, though; then only the hardware
+    monitor's poll, seeing the port go and come back, tells them apart.
+    """
+    links = tmp_path / "by-id"
+    good = _listing(links, None, 7)
+    listing = _listing(links, good.linked, 8, **failure)
+    (device,) = listing.devices
+    assert device.by_id is None
+    assert not (links / BY_ID).is_symlink()
+    assert listing.linked == {}
+
+
+@pytest.mark.parametrize(
+    "run",
+    [
+        pytest.param({"side_effect": OSError("no ioreg")}, id="no-iokit"),
+        pytest.param(
+            {"return_value": MagicMock(stdout=plistlib.dumps([]))}, id="left-out"
+        ),
+    ],
+)
+def test_first_listing_starts_from_the_links_on_disk(tmp_path: Path, run: dict) -> None:
+    """Test a Supervisor start without IOKit's details keeps the links it finds.
+
+    A Mac restart during an IOKit outage would otherwise leave the app whose
+    option names the link unable to start.
+    """
+    links = tmp_path / "by-id"
+    _listing(links, None, 7)
+    (links / "usb-unplugged-if00-port0").symlink_to("/dev/cu.gone")
+    listing = _listing(links, None, 7, **run)
+    assert not listing.complete
+    assert listing.devices[0].by_id == links / BY_ID
+    assert listing.linked == {Path("/dev", NODE): (7, BY_ID)}
+    assert (links / BY_ID).readlink() == Path("/dev", NODE)
+
+
+def test_first_listing_claims_no_port_with_two_links(tmp_path: Path) -> None:
+    """Test a port two links point at gets neither: one of them is stale."""
+    links = tmp_path / "by-id"
+    _listing(links, None, 7)
+    (links / "usb-OTHER-if00-port0").symlink_to(f"/dev/{NODE}")
+    listing = _listing(links, None, 7, side_effect=OSError("no ioreg"))
+    assert listing.devices[0].by_id is None
+    assert listing.linked == {}
+    assert (links / BY_ID).is_symlink()
+
+
+def test_a_port_iokit_leaves_out_keeps_its_link(tmp_path: Path) -> None:
+    """Test a linked port missing from a good ioreg answer keeps its link.
+
+    Only while it holds the same device; and the listing is tried again.
+    """
+    links = tmp_path / "by-id"
+    good = _listing(links, None, 7)
+    empty = {"return_value": MagicMock(stdout=plistlib.dumps([]))}
+
+    listing = _listing(links, good.linked, 7, **empty)
+    assert not listing.complete
+    assert listing.devices[0].by_id == links / BY_ID
+    assert (links / BY_ID).is_symlink()
+
+    listing = _listing(links, listing.linked, 8, **empty)
+    assert listing.complete
+    assert listing.devices[0].by_id is None
+    assert not (links / BY_ID).is_symlink()
 
 
 def _monitor(
@@ -161,14 +309,26 @@ def _monitor(
     present: dict[str, int],
     usb_loaded: bool,
     seen: dict[str, int] | None = None,
+    complete: bool = True,
+    complete_after: bool | None = None,
 ) -> HwMonitor:
-    """Return a monitor that knows `known` and now sees `present` (name: rdev)."""
+    """Return a monitor that knows `known` and now sees `present` (name: rdev).
+
+    `complete` is the last listing's; a reload's is `complete_after`.
+    """
     monitor = MagicMock()
     monitor.sys_hardware.devices = [_device(name) for name in known]
+    monitor.sys_hardware.native_complete = complete
     monitor._native_seen = frozenset(seen.items()) if seen is not None else None
+    monitor._native_retry_at = 0.0
+    monitor._native_retry_delay = NATIVE_POLL_SECONDS
+    monitor.sys_loop.time = MagicMock(return_value=100.0)
 
     async def reload() -> None:
         monitor.sys_hardware.devices = [_device(name) for name in sorted(present)]
+        monitor.sys_hardware.native_complete = (
+            complete if complete_after is None else complete_after
+        )
 
     monitor.sys_hardware.load_devices = AsyncMock(side_effect=reload)
     monitor.sys_run_in_executor = AsyncMock(return_value=frozenset(present.items()))
@@ -208,6 +368,46 @@ async def test_monitor_reloads_and_has_core_scan_on_a_new_port(
     assert send.call_count == scans
 
 
+async def test_monitor_retries_an_incomplete_listing_less_often() -> None:
+    """Test a listing without IOKit is redone after 5 s, 10 s, 20 s ..."""
+    monitor = _monitor(
+        ["cu.a"], {"cu.a": 1}, usb_loaded=True, seen={"cu.a": 1}, complete=False
+    )
+    waits = []
+    for _ in range(8):
+        monitor._native_retry_at = 0.0  # due
+        await HwMonitor._native_refresh(monitor)
+        waits.append(monitor._native_retry_at - 100.0)
+    assert waits == [5, 10, 20, 40, 80, 160, 300, 300]
+    assert monitor.sys_hardware.load_devices.await_count == 8
+    monitor.sys_homeassistant.websocket.send_command.assert_not_called()
+
+    # Not due yet: nothing
+    monitor._native_retry_at = 150.0
+    await HwMonitor._native_refresh(monitor)
+    assert monitor.sys_hardware.load_devices.await_count == 8
+
+
+async def test_monitor_has_core_scan_when_iokit_is_back_then_goes_quiet() -> None:
+    """Test recovery asks Core to scan, resets the wait, and stops retrying."""
+    monitor = _monitor(
+        ["cu.a"],
+        {"cu.a": 1},
+        usb_loaded=True,
+        seen={"cu.a": 1},
+        complete=False,
+        complete_after=True,
+    )
+    monitor._native_retry_delay = 80
+    await HwMonitor._native_refresh(monitor)
+    monitor.sys_hardware.load_devices.assert_awaited_once()
+    monitor.sys_homeassistant.websocket.send_command.assert_called_once()
+    assert monitor._native_retry_delay == NATIVE_POLL_SECONDS
+
+    await HwMonitor._native_refresh(monitor)
+    monitor.sys_hardware.load_devices.assert_awaited_once()
+
+
 async def test_monitor_reloads_on_a_removal_without_a_scan() -> None:
     """Test an unplugged port reloads the devices, with no scan."""
     monitor = _monitor(
@@ -235,7 +435,7 @@ def test_malformed_ioreg_still_lists_the_ports(tmp_path: Path) -> None:
                 hardware.subprocess, "run", return_value=MagicMock(stdout=output)
             ),
         ):
-            (device,) = hardware.list_devices(tmp_path / "by-id")
+            (device,) = hardware.list_devices(tmp_path / "by-id").devices
         assert device.name == "cu.usbserial-3110"
 
 
@@ -263,8 +463,43 @@ def test_long_names_are_shortened_uniquely() -> None:
 
 def test_this_mac(tmp_path: Path) -> None:
     """Test real discovery on the host running the tests."""
-    devices = hardware.list_devices(tmp_path / "by-id")
+    devices = hardware.list_devices(tmp_path / "by-id").devices
     usb = [device for device in devices if "usbserial" in device.name]
     if not usb:
         pytest.skip("no USB serial device on this host")
     assert all(device.attributes.get("ID_VENDOR_ID") for device in usb)
+
+
+def test_app_device_options_offer_and_accept_the_links(tmp_path: Path) -> None:
+    """Test a device(subsystem=tty) option lists the links and accepts them.
+
+    As on Linux, the settings page offers each port by its by-id link, and the
+    port by name when it has none.
+    """
+    links = tmp_path / "dev" / "serial" / "by-id"
+    plain = hardware.NativeDevice(
+        "cu.usbserial-9", Path("/dev/cu.usbserial-9"), Path("/dev/cu.usbserial-9"),
+        "tty", None, [], {"DEVNAME": "/dev/cu.usbserial-9", "SUBSYSTEM": "tty"}, [],
+    )  # fmt: skip
+    dongle = hardware.NativeDevice(
+        "cu.usbserial-140", Path("/dev/cu.usbserial-140"),
+        Path("/dev/cu.usbserial-140"), "tty", None, [links / BY_ID],
+        {"DEVNAME": "/dev/cu.usbserial-140", "SUBSYSTEM": "tty"}, [],
+    )  # fmt: skip
+    coresys = MagicMock()
+    coresys.hardware = HardwareManager(coresys, None)  # type: ignore[arg-type]
+    for device in (plain, dongle):
+        coresys.hardware.update_device(device)
+
+    (ui,) = UiOptions(coresys)({"device": "device(subsystem=tty)"})
+    assert ui["type"] == "select"
+    assert sorted(ui["options"]) == sorted([str(links / BY_ID), "/dev/cu.usbserial-9"])
+
+    schema = {"device": "device(subsystem=tty)"}
+    for value in (str(links / BY_ID), "/dev/cu.usbserial-140"):
+        options = AppOptions(coresys, schema, "OTBR", "otbr")
+        assert options({"device": value}) == {"device": value}
+        assert options.devices == {dongle}
+    for value in (str(links / "usb-gone-if00-port0"), "", None):
+        with pytest.raises(vol.Invalid):
+            AppOptions(coresys, schema, "OTBR", "otbr")({"device": value})

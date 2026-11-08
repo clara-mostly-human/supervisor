@@ -16,7 +16,7 @@ from pathlib import Path
 import plistlib
 import re
 import subprocess
-from typing import Any
+from typing import Any, NamedTuple
 
 from ..hardware.data import Device
 
@@ -125,19 +125,22 @@ def _fit(name: str) -> str:
     return f"{name.encode()[: _NAME_MAX - 17].decode(errors='ignore')}-{digest}"
 
 
-def sync_links(links_dir: Path, wanted: dict[str, Path]) -> set[str]:
+def sync_links(
+    links_dir: Path, wanted: dict[str, Path], prune: bool = True
+) -> set[str]:
     """Make links_dir hold the wanted name -> device links; return those in place.
 
-    Each link is handled on its own, so one that can't be written doesn't cost
-    the others theirs.
+    With prune, links that aren't wanted are removed. Each link is handled on
+    its own, so one that can't be written doesn't cost the others theirs.
     """
     links_dir.mkdir(parents=True, exist_ok=True)
-    for entry in links_dir.iterdir():
-        if entry.name not in wanted and entry.is_symlink():
-            try:
-                entry.unlink()
-            except OSError as err:
-                _LOGGER.warning("Can't remove the stale link %s: %s", entry, err)
+    if prune:
+        for entry in links_dir.iterdir():
+            if entry.name not in wanted and entry.is_symlink():
+                try:
+                    entry.unlink()
+                except OSError as err:
+                    _LOGGER.warning("Can't remove the stale link %s: %s", entry, err)
     in_place = set()
     for name, target in wanted.items():
         link = links_dir / name
@@ -154,51 +157,156 @@ def sync_links(links_dir: Path, wanted: dict[str, Path]) -> set[str]:
     return in_place
 
 
-def _usb_attributes(nodes: list[Path]) -> dict[Path, tuple[dict, str | None]]:
-    """Return each port's attributes and by-id name; never raises."""
+class Listing(NamedTuple):
+    """The serial devices, and what the next listing needs to know."""
+
+    devices: list[Device]
+    # False if IOKit couldn't be read, or knew nothing of a port with a link
+    complete: bool
+    # Port -> (device number, link name), for each link in place
+    linked: dict[Path, tuple[int, str]]
+
+
+def _linked_on_disk(
+    links_dir: Path | None, numbers: dict[Path, int]
+) -> dict[Path, tuple[int, str]]:
+    """Return the links already in links_dir, for a first listing to start from.
+
+    Only a port with exactly one link counts: two would mean one is stale.
+    """
+    if links_dir is None:
+        return {}
+    found: dict[Path, list[str]] = {}
+    try:
+        entries = sorted(links_dir.iterdir())
+    except OSError:
+        return {}
+    for entry in entries:
+        if entry.name.endswith(_LINK_TMP_SUFFIX):
+            continue
+        try:
+            target = entry.readlink()
+        except OSError:
+            continue
+        if target in numbers:
+            found.setdefault(target, []).append(entry.name)
+    return {
+        node: (numbers[node], names[0])
+        for node, names in found.items()
+        if len(names) == 1
+    }
+
+
+def _device_numbers(nodes: list[Path]) -> dict[Path, int]:
+    """Return each port's device number; another device gets another one."""
+    numbers: dict[Path, int] = {}
+    for node in nodes:
+        try:
+            numbers[node] = node.stat().st_rdev
+        except OSError:
+            continue
+    return numbers
+
+
+def _usb_attributes(
+    nodes: list[Path], warn: bool = True
+) -> tuple[dict[Path, tuple[dict, str | None]], bool]:
+    """Return each port's attributes and by-id name, and whether IOKit was read.
+
+    Never raises.
+    """
+    log = _LOGGER.warning if warn else _LOGGER.debug
+    read = True
     try:
         usb = _usb_serial_info() if nodes else {}
     except Exception as err:  # pylint: disable=broad-except
-        _LOGGER.warning("Can't read USB details from IOKit: %s", err)
+        log("Can't read USB details from IOKit: %s", err)
         usb = {}
+        read = False
     named: dict[Path, tuple[dict, str | None]] = {}
     for node in nodes:
         try:
             named[node] = _attributes(node, usb.get(str(node)))
         except Exception as err:  # pylint: disable=broad-except
-            _LOGGER.warning("Can't read the USB details of %s: %s", node, err)
+            log("Can't read the USB details of %s: %s", node, err)
             named[node] = _attributes(node, None)
-    return named
+    return named, read
 
 
-def list_devices(links_dir: Path | None = None) -> list[Device]:
+def _drop_stale(
+    links_dir: Path, linked: dict[Path, tuple[int, str]], numbers: dict[Path, int]
+) -> None:
+    """Remove the links whose port went away or now holds another device."""
+    for node, (number, name) in linked.items():
+        if numbers.get(node) == number:
+            continue
+        link = links_dir / name
+        try:
+            if link.is_symlink() and link.readlink() == node:
+                link.unlink()
+        except OSError as err:
+            _LOGGER.warning("Can't remove the stale link %s: %s", link, err)
+
+
+def list_devices(
+    links_dir: Path | None = None,
+    linked: dict[Path, tuple[int, str]] | None = None,
+    warn: bool = True,
+) -> Listing:
     """Return the host's serial devices, keeping their by-id links in links_dir.
 
     The ports are listed even if IOKit or the links fail: apps' device options
     are validated against this list, so a missing port stops an app starting.
+    `linked` comes from the previous listing; a first one (None) starts from
+    the links on disk. A port IOKit knows nothing of keeps its link while it
+    holds the same device, and if IOKit can't be read no other link is
+    removed, since all would look stale. Either makes the listing incomplete,
+    to be tried again. "Same device" is the device number, which macOS may
+    give the next device in that port: a swap faster than the hardware
+    monitor's poll can pass for the old dongle while IOKit is out, and the app
+    then fails to talk to it.
     """
     nodes = [Path("/dev", name) for name in sorted(serial_nodes())]
-    named = _usb_attributes(nodes)
+    numbers = _device_numbers(nodes)
+    if linked is None:
+        linked = _linked_on_disk(links_dir, numbers)
+    named, iokit_read = _usb_attributes(nodes, warn)
+    complete = iokit_read
     names = [name for _, name in named.values() if name]
     wanted = {
         name: node
         for node, (_, name) in named.items()
         if name and names.count(name) == 1
     }
+    for node, (_, name) in named.items():
+        prior = linked.get(node)
+        if name is not None or prior is None or numbers.get(node) != prior[0]:
+            continue
+        if prior[1] in wanted:
+            continue
+        wanted[prior[1]] = node
+        complete = False
+        if iokit_read:
+            (_LOGGER.warning if warn else _LOGGER.debug)(
+                "IOKit has no USB details for %s; keeping its link %s", node, prior[1]
+            )
+
     in_place: set[str] = set()
     if links_dir is not None:
         try:
-            in_place = sync_links(links_dir, wanted)
+            if not iokit_read:
+                _drop_stale(links_dir, linked, numbers)
+            in_place = sync_links(links_dir, wanted, prune=iokit_read)
         except OSError as err:
             _LOGGER.warning("Can't update the by-id links in %s: %s", links_dir, err)
+    links = {
+        node: [links_dir / name]
+        for name, node in wanted.items()
+        if links_dir is not None and name in in_place
+    }
 
     devices: list[Device] = []
-    for node, (attributes, name) in named.items():
-        links = (
-            [links_dir / name]
-            if links_dir is not None and name is not None and name in in_place
-            else []
-        )
+    for node, (attributes, _) in named.items():
         devices.append(
             NativeDevice(
                 name=node.name,
@@ -206,12 +314,20 @@ def list_devices(links_dir: Path | None = None) -> list[Device]:
                 sysfs=node,
                 subsystem="tty",
                 parent=None,
-                links=links,
+                links=links.get(node, []),
                 attributes=attributes,
                 children=[],
             )
         )
-    return devices
+    return Listing(
+        devices,
+        complete,
+        {
+            node: (numbers[node], name)
+            for name, node in wanted.items()
+            if name in in_place and node in numbers
+        },
+    )
 
 
 def serial_identity() -> frozenset[tuple[str, int]]:
