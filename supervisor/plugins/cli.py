@@ -3,7 +3,9 @@
 Code: https://github.com/home-assistant/plugin-cli
 """
 
+import asyncio
 from collections.abc import Awaitable
+from contextlib import suppress
 import logging
 import secrets
 
@@ -29,6 +31,8 @@ from ..exceptions import (
 )
 from ..jobs.const import JobThrottle
 from ..jobs.decorator import Job
+from ..native import IS_MACOS
+from ..native.cli import NativeCli
 from ..utils.sentry import async_capture_exception
 from .base import PluginBase
 from .const import (
@@ -41,6 +45,9 @@ from .validate import SCHEMA_CLI_CONFIG
 
 _LOGGER: logging.Logger = logging.getLogger(__name__)
 
+NATIVE_BUILD_ATTEMPTS = 3
+NATIVE_BUILD_RETRY_SECONDS = 120
+
 
 class PluginCli(PluginBase):
     """HA cli interface inside supervisor."""
@@ -50,7 +57,11 @@ class PluginCli(PluginBase):
         super().__init__(FILE_HASSIO_CLI, SCHEMA_CLI_CONFIG)
         self.slug = "cli"
         self.coresys: CoreSys = coresys
-        self.instance: DockerCli = DockerCli(coresys)
+        self.instance: DockerCli = (
+            NativeCli(coresys)  # type: ignore[assignment]
+            if IS_MACOS
+            else DockerCli(coresys)
+        )
 
     @property
     def default_image(self) -> str:
@@ -113,6 +124,39 @@ class PluginCli(PluginBase):
         except DockerError as err:
             _LOGGER.error("Could not get stats of container for HA cli: %s", err)
             raise CliUnknownError from err
+
+    async def load(self) -> None:
+        """Load the CLI; natively, build it in the background the first time."""
+        if IS_MACOS and self.enabled and not await self.instance.exists():
+            with suppress(DockerError):
+                version = self.version or await self.instance.get_latest_version()
+                await self.instance.attach(version=version)
+        if IS_MACOS and self.enabled and not await self.instance.exists():
+            # A Go build takes a minute and needs the network: never hold up
+            # the Supervisor's startup for a command-line tool
+            self.sys_create_task(self._build_natively())
+            return
+        await super().load()
+
+    async def _build_natively(self) -> None:
+        """Build and link the native ha command, with a few retries."""
+        for attempt in range(NATIVE_BUILD_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(NATIVE_BUILD_RETRY_SECONDS)
+            try:
+                # Like update: never side by side with `ha cli update`
+                async with self._lifecycle_lock:
+                    if not await self.instance.exists():
+                        await self._install()
+                    await self.start()
+            except Exception as err:  # pylint: disable=broad-except
+                # A background task: log every failure, never lose it silently
+                _LOGGER.warning("Can't set up the ha command: %s", err)
+            else:
+                return
+        _LOGGER.error(
+            "The ha command isn't set up; it is tried again when the Supervisor starts"
+        )
 
     def is_running(self) -> Awaitable[bool]:
         """Return True if Docker container is running.

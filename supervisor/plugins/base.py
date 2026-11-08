@@ -51,9 +51,10 @@ class PluginBase(ABC, FileConfiguration, CoreSysAttributes):
         """Return True if the plugin is enabled.
 
         The plugins are containers (DNS, audio, CLI, observer, mDNS
-        forwarding); a native host provides these itself.
+        forwarding); a native host provides these itself, except the CLI,
+        which is built natively (see native/cli.py).
         """
-        if IS_MACOS:
+        if IS_MACOS and self.slug != "cli":
             return False
         return self._data.get(ATTR_ENABLED, True)
 

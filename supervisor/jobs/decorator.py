@@ -18,6 +18,7 @@ from ..exceptions import (
     JobStartException,
 )
 from ..host.const import HostFeature
+from ..native import IS_MACOS
 from ..resolution.const import (
     MINIMUM_FREE_SPACE_THRESHOLD,
     ContextType,
@@ -547,6 +548,8 @@ class Job(CoreSysAttributes):
                 plugin
                 for plugin in coresys.sys_plugins.all_plugins
                 if plugin.need_update
+                # Nothing depends on the native CLI (a Go build that can fail)
+                and not (IS_MACOS and plugin.slug == "cli")
             ]
         ):
             if not coresys.sys_updater.auto_update:

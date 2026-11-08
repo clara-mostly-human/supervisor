@@ -70,7 +70,8 @@ class PluginManager(CoreSysAttributes):
     @property
     def active_plugins(self) -> list[PluginBase]:
         """Return the plugins that run on this host."""
-        return [] if IS_MACOS else self.all_plugins
+        # Natively only the CLI is a plugin: the host provides the others
+        return [self.cli] if IS_MACOS else self.all_plugins
 
     async def load(self) -> None:
         """Load Supervisor plugins."""
@@ -103,6 +104,10 @@ class PluginManager(CoreSysAttributes):
         for plugin in self.all_plugins:
             # Check if need an update
             if not plugin.need_update:
+                continue
+            # A native CLI update is a Go build: leave it to the scheduled
+            # CLI update instead of holding up startup
+            if IS_MACOS and plugin.slug == "cli":
                 continue
 
             _LOGGER.info(
