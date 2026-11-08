@@ -38,16 +38,19 @@ Running in production on a Mac mini since 2026-10-18:
 Each step lands in this branch with tests, and production moves to it in a
 planned cutover.
 
-1. **Install and boot like an appliance.**
-   - **One installer:** `macos/install.sh` turns a fresh Mac into a Home
-     Assistant host and ends on the onboarding page. Later this becomes a
-     signed package.
-   - **A fixed layout:** paths are the same on every Mac, as `/mnt/data` is
-     on Home Assistant OS. Backups and device paths then move between Macs
-     unchanged.
-   - **Starting at power-on with nobody logged in:** system launchd services
-     instead of login items, and macOS power settings that restart the Mac
-     after a power cut.
+1. **An app that installs and boots like an appliance.**
+   - **The app:** `Home Assistant.app`, dragged into Applications. It carries
+     the Supervisor, its Python runtime and the root helper. On first launch
+     it sets everything up and opens onboarding. A menu bar item shows
+     whether Home Assistant is running and opens it.
+   - **Starting at power-on with nobody logged in:** the app registers its
+     system services with macOS (SMAppService), which the user approves once
+     under System Settings › Login Items. macOS power settings restart the
+     Mac after a power cut.
+   - **A fixed data folder:** `/Library/HomeAssistant`, the same on every Mac,
+     as `/mnt/data` is on Home Assistant OS. Backups and device paths then
+     move between Macs unchanged. The name has no spaces, because uv splits
+     paths on them.
 2. **The OS agent.** What Home Assistant OS does through systemd, the root
    helper does here:
    - restart and shut down the host;
@@ -71,6 +74,9 @@ Assistant OS, so those stay off.
 - **Bluetooth and boot without login.** Core uses Bluetooth through
   CoreBluetooth. Whether a system service that starts before anyone logs in
   can use it is untested.
+- **Signing.** For other people to open the app without warnings, it has to
+  be signed with an Apple Developer ID and notarized. Whether services
+  registered by a self-signed app run at all is untested.
 - **FileVault.** With FileVault on, a Mac waits for its password after a power
   cut, before any service starts.
 
