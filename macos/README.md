@@ -80,11 +80,21 @@ Assistant OS, so those stay off.
     CoreBluetooth reports `unauthorized`. No prompt is shown.
   - Core running in the logged-in user's session, as it does today, has
     Bluetooth.
-  - Still untested:
-    - whether a configuration profile can grant a system service Bluetooth;
-    - whether the service starts before anyone logs in (needs a reboot).
-  - Bluetooth proxies on the network (ESPHome) don't use the Mac's radio,
-    so they work either way.
+  - Apple says this is by design. An Apple developer support engineer wrote
+    in Apple's developer forums (December 2025, thread 805809) that using
+    Core Bluetooth outside of a GUI login context is unsupported and will
+    remain unsupported.
+  - A privacy profile (PPPC) can name Bluetooth, with these limits:
+    - it is accepted only from a user-approved device management (MDM)
+      enrollment, never installed by hand;
+    - nobody reports it working for a system service;
+    - it is deprecated in macOS 27. Its replacement there works only on
+      supervised Macs.
+  - So the Mac's own Bluetooth is only available to Core running in a
+    logged-in user's session. Bluetooth proxies on the network (ESPHome)
+    don't use the Mac's radio, so they work either way.
+  - Still untested: whether the service starts before anyone logs in (needs
+    a reboot).
 - **Signing.** A self-signed (ad-hoc) app can register a system service. The
   user approves it once under System Settings › General › Login Items &
   Extensions › App Background Activity, and it then runs. For other people to
