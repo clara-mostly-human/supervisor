@@ -72,11 +72,24 @@ Assistant OS, so those stay off.
 ## Open questions
 
 - **Bluetooth and boot without login.** Core uses Bluetooth through
-  CoreBluetooth. Whether a system service that starts before anyone logs in
-  can use it is untested.
-- **Signing.** For other people to open the app without warnings, it has to
-  be signed with an Apple Developer ID and notarized. Whether services
-  registered by a self-signed app run at all is untested.
+  CoreBluetooth. A test on macOS 26.5 (2026-11-13) with a system service
+  registered through SMAppService:
+  - The service ran as root.
+  - Its Bluetooth request was refused: macOS's privacy service (TCC)
+    refuses Bluetooth to a process "in background session", and
+    CoreBluetooth reports `unauthorized`. No prompt is shown.
+  - Core running in the logged-in user's session, as it does today, has
+    Bluetooth.
+  - Still untested:
+    - whether a configuration profile can grant a system service Bluetooth;
+    - whether the service starts before anyone logs in (needs a reboot).
+  - Bluetooth proxies on the network (ESPHome) don't use the Mac's radio,
+    so they work either way.
+- **Signing.** A self-signed (ad-hoc) app can register a system service. The
+  user approves it once under System Settings › General › Login Items &
+  Extensions › App Background Activity, and it then runs. For other people to
+  open the app without warnings, it still has to be signed with an Apple
+  Developer ID and notarized.
 - **FileVault.** With FileVault on, a Mac waits for its password after a power
   cut, before any service starts.
 
