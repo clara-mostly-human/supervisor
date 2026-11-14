@@ -93,6 +93,16 @@ Assistant OS, so those stay off.
   - So the Mac's own Bluetooth is only available to Core running in a
     logged-in user's session. Bluetooth proxies on the network (ESPHome)
     don't use the Mac's radio, so they work either way.
+  - A radio of its own avoids the question. A Silicon Labs dongle running
+    the SDK's production "Bluetooth - RCP" firmware speaks standard HCI over
+    a serial port: macOS sees a serial device, not Bluetooth, so neither
+    `bluetoothd` nor TCC is involved. An app could drive it with a userspace
+    stack ([Bumble](https://github.com/google/bumble)) and present it to Core
+    as an ESPHome Bluetooth proxy, with no change to Core.
+    - A USB Bluetooth dongle also works with Bumble, after
+      `sudo nvram bluetoothHostControllerSwitchBehavior=never`, which stops
+      `bluetoothd` taking it over.
+    - Not built or tested yet.
   - Still untested: whether the service starts before anyone logs in (needs
     a reboot).
 - **Signing.** A self-signed (ad-hoc) app can register a system service. The
