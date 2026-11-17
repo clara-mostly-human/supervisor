@@ -61,7 +61,7 @@ from ..homeassistant.const import LANDINGPAGE
 from ..jobs.job_group import JobGroup
 from .docker import LOCALHOST
 from .hardware import NATIVE_BY_ID
-from .launchd import LaunchAgent, LaunchdError
+from .launchd import LaunchdError, service
 from .stats import process_stats
 
 if TYPE_CHECKING:
@@ -648,7 +648,7 @@ class NativeHomeAssistant(JobGroup):
         self._environment: dict[str, str] = {}
         self._watch_task: asyncio.Task | None = None
         self._last_state: ContainerState | None = None
-        self.agent = LaunchAgent(f"{_launchd_prefix()}.core")
+        self.agent = service(f"{_launchd_prefix()}.core")
 
     # Paths
 

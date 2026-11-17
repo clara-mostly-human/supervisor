@@ -15,6 +15,19 @@ What it does, and nothing else:
   "<prefix>.app.<slug>", whose program must be inside that root-owned folder.
 * copy: copy files root may read but the user may not (an app's data, e.g.
   OTBR's Thread credentials) between folders in the user's home.
+* user_service / user_bootstrap / user_kickstart / user_bootout /
+  user_unservice: manage LaunchDaemons "<prefix>.supervisor", "<prefix>.core"
+  and "<prefix>.app.<slug>" that run as the Supervisor's user, not as root.
+  They let Home Assistant run with nobody logged in: a LaunchAgent lives only
+  as long as the user's GUI session. The user chooses what they run, as with
+  a LaunchAgent, and they get nothing the user lacks: root only writes the
+  plist and loads it. launchd starts /bin/sh as the user, which reads the
+  environment from a file only the user can read (a plist, and launchctl
+  print, show the environment to every account: it holds API tokens) and
+  opens the logs itself, as the user.
+  These verbs never touch a plist that is not a user service of this user,
+  nor a loaded job that runs as anyone else, so they cannot replace, stop or
+  remove a root daemon.
 
 Runs on Apple's /usr/bin/python3 (3.9, standard library only): an interpreter
 the user cannot modify. Test mode (--test DIR) runs unprivileged against the
@@ -29,16 +42,28 @@ import re
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
 
-VERSION = 1
+VERSION = 2
 RE_SLUG = re.compile(r"^[a-z0-9_]{1,64}$")
 RE_VERSION = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
 RE_PREFIX = re.compile(r"^ha-macos(-[a-z0-9]{1,16})?$")
 RE_ENV_KEY = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
+RE_USER_SERVICE = re.compile(r"^(supervisor|core|app\.[a-z0-9_]{1,64})$")
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+# What a root app may get from the Supervisor's environment, and nothing else:
+# variables such as BASH_ENV, ENV or SHELLOPTS make a root shell run user code.
+ROOT_ENV_KEYS = ("SUPERVISOR", "HASSIO", "SUPERVISOR_TOKEN", "HASSIO_TOKEN", "TZ")
+ROOT_ENV_PREFIXES = ("APP_", "PORT_")
+# A user service's program: sh, as the user, sources the environment file and
+# runs the program with its output appended to the logs.
+USER_WRAPPER = (
+    'out=$2; err=$3; exec >>"$out" 2>>"$err"; '
+    'set -a; . "$1" || exit 78; set +a; shift 3; exec "$@"'
+)
 
 
 class Refused(Exception):
@@ -48,7 +73,8 @@ class Refused(Exception):
 class Helper:
     def __init__(self, uid, base, daemons, domain, chown):
         self.uid = uid
-        self.home = os.path.realpath(os.path.expanduser("~%s" % _user_name(uid)))
+        self.user = _user_name(uid)
+        self.home = os.path.realpath(os.path.expanduser("~%s" % self.user))
         self.base = base
         self.daemons = daemons
         self.domain = domain
@@ -63,14 +89,14 @@ class Helper:
         return real
 
     def _app_root(self, prefix, slug, version=None):
-        if not RE_PREFIX.match(prefix or ""):
+        if not RE_PREFIX.fullmatch(prefix or ""):
             raise Refused("bad prefix")
-        if not RE_SLUG.match(slug or ""):
+        if not RE_SLUG.fullmatch(slug or ""):
             raise Refused("bad slug")
         root = os.path.join(self.base, "apps", prefix, slug)
         if version is None:
             return root
-        if not RE_VERSION.match(version or ""):
+        if not RE_VERSION.fullmatch(version or ""):
             raise Refused("bad version")
         return os.path.join(root, version)
 
@@ -95,10 +121,17 @@ class Helper:
     def _status(self, label):
         code, text = self._launchctl("print", "%s/%s" % (self.domain, label))
         if code != 0:
-            return {"loaded": False, "running": False, "pid": None, "exit": None}
+            return {
+                "loaded": False,
+                "running": False,
+                "pid": None,
+                "exit": None,
+                "user": None,
+            }
         state = re.search(r"^\s*state = (\S+)", text, re.M)
         pid = re.search(r"^\s*pid = (\d+)", text, re.M)
         exit_code = re.search(r"^\s*last exit code = (-?\d+)", text, re.M)
+        user = re.search(r"^\s*username = (\S+)", text, re.M)
         signalled = re.search(r"^\s*last terminating signal = ", text, re.M)
         running = bool(state and state.group(1) == "running")
         code_value = int(exit_code.group(1)) if exit_code else None
@@ -109,6 +142,8 @@ class Helper:
             "running": running,
             "pid": int(pid.group(1)) if pid else None,
             "exit": code_value,
+            # Only jobs with a UserName show one; root daemons show none.
+            "user": user.group(1) if user else None,
         }
 
     # Commands
@@ -156,14 +191,14 @@ class Helper:
             raise Refused("program must be an executable inside the installed app")
         env = {}
         for key, value in (req.get("env") or {}).items():
-            if not RE_ENV_KEY.match(key) or not isinstance(value, str):
+            if not RE_ENV_KEY.fullmatch(key) or not isinstance(value, str):
                 raise Refused("bad environment")
-            # Never let the user account choose what root loads or runs:
-            # no dynamic-loader variables, and only system folders on PATH.
-            if key.startswith(("DYLD_", "LD_")) or key == "PATH":
-                continue
-            env[key] = value
+            # Never let the user account choose what root loads or runs: only
+            # the Supervisor's own variables pass (no DYLD_*, BASH_ENV, ...).
+            if key in ROOT_ENV_KEYS or key.startswith(ROOT_ENV_PREFIXES):
+                env[key] = value
         env["PATH"] = SYSTEM_PATH
+        env["HOME"] = root
         args = req.get("args") or []
         if not all(isinstance(arg, str) for arg in args):
             raise Refused("bad arguments")
@@ -225,17 +260,233 @@ class Helper:
             os.remove(path)
         return {}
 
-    def cmd_copy(self, req):
-        source = self._inside_home(req["source"])
-        dest = self._inside_home(req["dest"])
-        if not os.path.isdir(source):
-            raise Refused("source is not a folder")
-        os.makedirs(dest, exist_ok=True)
-        for name in os.listdir(source):
-            src = os.path.join(source, name)
-            if os.path.isfile(src) and not os.path.islink(src):
-                shutil.copy2(src, os.path.join(dest, name))
+    # User services
+
+    def _user_label(self, prefix, name):
+        if not RE_PREFIX.fullmatch(prefix or ""):
+            raise Refused("bad prefix")
+        if not RE_USER_SERVICE.fullmatch(name or ""):
+            raise Refused("bad service name")
+        return "%s.%s" % (prefix, name)
+
+    def _read_plist(self, path):
+        try:
+            with open(path, "rb") as file:
+                return plistlib.load(file)
+        except FileNotFoundError:
+            return None
+
+    def _is_user_service(self, data, label):
+        return (
+            isinstance(data, dict)
+            and data.get("Label") == label
+            and data.get("UserName") == self.user
+        )
+
+    def _user_service(self, req):
+        """Return (label, plist path) of a defined user service, or refuse."""
+        label = self._user_label(req["prefix"], req["name"])
+        path = self._plist(label)
+        if not self._is_user_service(self._read_plist(path), label):
+            raise Refused("%s is not a user service" % label)
+        return label, path
+
+    def _require_user_job(self, label):
+        """Refuse if label is loaded and runs as anyone but the user."""
+        status = self._status(label)
+        if status["loaded"] and status["user"] != self.user:
+            raise Refused("%s runs as %s" % (label, status["user"] or "root"))
+        return status
+
+    def cmd_user_service(self, req):
+        label = self._user_label(req["prefix"], req["name"])
+        path = self._plist(label)
+        existing = self._read_plist(path)
+        if existing is not None and not self._is_user_service(existing, label):
+            raise Refused("%s exists and is not a user service" % label)
+        # A root job loaded under this label (its plist gone) would be
+        # replaced by this plist at the next boot.
+        self._require_user_job(label)
+        program = req.get("program")
+        if (
+            not isinstance(program, list)
+            or not program
+            or not all(isinstance(arg, str) and "\0" not in arg for arg in program)
+        ):
+            raise Refused("bad program")
+        # Where the program lives doesn't matter: it runs as the user, who can
+        # run anything as themselves (a venv's python links out of the home).
+        if not os.path.isabs(program[0]) or not os.access(program[0], os.X_OK):
+            raise Refused("program must be an absolute path to an executable")
+        # The user's sh opens these, not root: inside the home for tidiness.
+        env_file = self._inside_home(req["env_file"])
+        stdout = self._inside_home(req["stdout"])
+        stderr = self._inside_home(req.get("stderr") or stdout)
+        data = {
+            "Label": label,
+            "UserName": self.user,
+            "ProgramArguments": ["/bin/sh", "-c", USER_WRAPPER, label, env_file]
+            + [stdout, stderr]
+            + program,
+            "EnvironmentVariables": {"HOME": self.home},
+            "WorkingDirectory": self._inside_home(req["working_directory"]),
+            "RunAtLoad": bool(req.get("run_at_load")),
+            "KeepAlive": bool(req.get("keep_alive")),
+            # Without a ProcessType launchd throttles a job's CPU and I/O
+            # (man launchd.plist); Interactive is what apps get: no limits.
+            "ProcessType": "Interactive",
+        }
+        throttle = req.get("throttle_interval")
+        if throttle is not None:
+            if (
+                not isinstance(throttle, int)
+                or isinstance(throttle, bool)
+                or not 1 <= throttle <= 3600
+            ):
+                raise Refused("bad throttle interval")
+            data["ThrottleInterval"] = throttle
+        os.makedirs(self.daemons, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "wb") as file:
+            plistlib.dump(data, file)
+        os.chmod(tmp, 0o644)
+        os.rename(tmp, path)
+        return {"label": label}
+
+    def cmd_user_bootstrap(self, req):
+        label, path = self._user_service(req)
+        if self._require_user_job(label)["loaded"]:
+            return {}
+        code, text = self._launchctl("bootstrap", self.domain, path)
+        if code != 0:
+            raise Refused("launchctl bootstrap: %s" % text.strip())
         return {}
+
+    def cmd_user_kickstart(self, req):
+        label, _ = self._user_service(req)
+        if not self._require_user_job(label)["loaded"]:
+            raise Refused("%s is not loaded" % label)
+        code, text = self._launchctl("kickstart", "%s/%s" % (self.domain, label))
+        if code != 0:
+            raise Refused("launchctl kickstart: %s" % text.strip())
+        return {}
+
+    def cmd_user_bootout(self, req):
+        """Unload; the Supervisor stops the process first (it runs as the user)."""
+        label = self._user_label(req["prefix"], req["name"])
+        if not self._require_user_job(label)["loaded"]:
+            return {}
+        self._launchctl("bootout", "%s/%s" % (self.domain, label))
+        return {}
+
+    def cmd_user_unservice(self, req):
+        label = self._user_label(req["prefix"], req["name"])
+        path = self._plist(label)
+        data = self._read_plist(path)
+        if data is not None and not self._is_user_service(data, label):
+            raise Refused("%s is not a user service" % label)
+        if self._require_user_job(label)["loaded"]:
+            self._launchctl("bootout", "%s/%s" % (self.domain, label))
+            deadline = time.monotonic() + 30
+            while self._status(label)["loaded"]:
+                if time.monotonic() >= deadline:
+                    raise Refused("%s is still loaded; plist kept" % label)
+                time.sleep(0.5)
+        if data is not None:
+            os.remove(path)
+        return {}
+
+    def _open_dir(self, path, create=False):
+        """Open a folder inside the home as a descriptor, following no links.
+
+        Each component is opened from the home down with O_NOFOLLOW, so a
+        symlink put anywhere on the way (also after the check) makes this
+        fail instead of leading root out of the home. Folders it creates
+        belong to the user.
+        """
+        real = self._inside_home(path)
+        parts = [p for p in os.path.relpath(real, self.home).split(os.sep) if p != "."]
+        fd = os.open(self.home, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in parts:
+                if create:
+                    try:
+                        os.mkdir(part, 0o755, dir_fd=fd)
+                        if self.chown:
+                            os.chown(part, self.uid, -1, dir_fd=fd, follow_symlinks=False)
+                    except FileExistsError:
+                        pass
+                try:
+                    child = os.open(
+                        part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+                    )
+                except OSError as err:
+                    raise Refused("%s: %s" % (path, err.strerror))
+                os.close(fd)
+                fd = child
+            return fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def cmd_copy(self, req):
+        src_dir = self._open_dir(req["source"])
+        try:
+            dst_dir = self._open_dir(req["dest"], create=True)
+        except BaseException:
+            os.close(src_dir)
+            raise
+        try:
+            for name in os.listdir(src_dir):
+                self._copy_file(src_dir, dst_dir, name)
+        finally:
+            os.close(src_dir)
+            os.close(dst_dir)
+        return {}
+
+    def _copy_file(self, src_dir, dst_dir, name):
+        """Copy one regular file; skip links and anything else (copy2 rules).
+
+        An existing destination keeps its owner (the Supervisor creates empty
+        files first so that the copies stay readable to it); a new one is
+        root's. Links at either end are never followed.
+        """
+        flags = os.O_NOFOLLOW | os.O_NONBLOCK  # no links; a FIFO never blocks
+        try:
+            src = os.open(name, os.O_RDONLY | flags, dir_fd=src_dir)
+        except OSError:
+            return  # a symlink (ELOOP) or gone
+        try:
+            info = os.fstat(src)
+            # A hard link could name any file root may read: copy only files
+            # with a single name.
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return
+            try:
+                dst = os.open(name, os.O_WRONLY | os.O_CREAT | flags, 0o600, dir_fd=dst_dir)
+            except OSError as err:
+                raise Refused("cannot write %s: %s" % (name, err.strerror))
+            try:
+                # Truncate only once it is known to be a plain file of its own:
+                # a hard link there would make root overwrite its other name.
+                target = os.fstat(dst)
+                if not stat.S_ISREG(target.st_mode) or target.st_nlink != 1:
+                    raise Refused("%s is not a plain file" % name)
+                os.ftruncate(dst, 0)
+                while True:
+                    chunk = os.read(src, 1 << 20)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        view = view[os.write(dst, view):]
+                # Never setuid, setgid or sticky: root writes this file.
+                os.fchmod(dst, stat.S_IMODE(info.st_mode) & 0o777)
+                os.utime(dst, ns=(info.st_atime_ns, info.st_mtime_ns))
+            finally:
+                os.close(dst)
+        finally:
+            os.close(src)
 
     def handle(self, request):
         command = request.get("command")
@@ -286,7 +537,7 @@ def serve(helper, socket_path):
                 % (
                     time.strftime("%F %T"),
                     request.get("command"),
-                    request.get("slug", ""),
+                    request.get("slug") or request.get("name", ""),
                     outcome,
                 ),
                 flush=True,

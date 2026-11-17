@@ -1,8 +1,13 @@
 #!/bin/bash
-# Remove the root helper and every app service it manages.
+# Remove the root helper and every service it manages: root apps, and in the
+# system layout also the Supervisor, Core and apps that run as the user (this
+# stops Home Assistant; switch back first with
+# `python -m supervisor.native.layout session` to keep it running).
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 1; }
-for plist in /Library/LaunchDaemons/ha-macos*.app.*.plist; do
+for plist in /Library/LaunchDaemons/ha-macos*.app.*.plist \
+             /Library/LaunchDaemons/ha-macos*.core.plist \
+             /Library/LaunchDaemons/ha-macos*.supervisor.plist; do
   [ -e "$plist" ] || continue
   label=$(basename "$plist" .plist)
   launchctl bootout "system/$label" 2>/dev/null || true

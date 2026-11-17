@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 from typing import Any
 
 SOCKET = os.environ.get("SUPERVISOR_HELPER_SOCKET", "/var/run/ha-macos-helper.sock")
@@ -34,6 +35,30 @@ async def call(command: str, **params: Any) -> dict[str, Any]:
         line = await asyncio.wait_for(reader.readline(), TIMEOUT)
     finally:
         writer.close()
+    return _result(command, line)
+
+
+def call_sync(command: str, **params: Any) -> dict[str, Any]:
+    """Send one request to the helper from a worker thread (blocking)."""
+    request = (json.dumps({"command": command, **params}) + "\n").encode()
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(TIMEOUT)
+            sock.connect(SOCKET)
+            sock.sendall(request)
+            line = b""
+            while not line.endswith(b"\n"):
+                if not (chunk := sock.recv(65536)):
+                    break
+                line += chunk
+    except OSError as err:
+        raise HelperError(
+            f"The root helper is not reachable ({SOCKET}): {err}"
+        ) from err
+    return _result(command, line)
+
+
+def _result(command: str, line: bytes) -> dict[str, Any]:
     try:
         reply = json.loads(line)
     except ValueError as err:

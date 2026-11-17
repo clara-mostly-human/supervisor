@@ -12,9 +12,11 @@ A native app is an app repository folder with the usual ``config.yaml`` (no
 
 Each version is installed under ``<data>/apps/native/<slug>/versions/<version>``
 (a copy of the app folder in ``app/``, a venv if there are requirements, build
-output in ``out/``). Unprivileged apps run as a per-user LaunchAgent;
-privileged ones are copied by the root helper into a root-owned folder and run
-as a LaunchDaemon. The app gets the environment a container app gets,
+output in ``out/``). Unprivileged apps run as the Supervisor's user: a
+LaunchAgent in the user's session, or, in the system layout, a LaunchDaemon with
+UserName set (see launchd.py). Privileged ones are copied by the root helper
+into a root-owned folder and run as a root LaunchDaemon. The app gets the
+environment a container app gets,
 translated to the host:
 
 * ``SUPERVISOR`` / ``SUPERVISOR_TOKEN``: the Supervisor API and the app's token
@@ -54,7 +56,7 @@ from ..jobs.job_group import JobGroup
 from . import NATIVE_RECIPE as RECIPE, helper
 from .docker import LOCALHOST
 from .homeassistant import _launchd_prefix, _python, _run, api_address
-from .launchd import BOOTOUT_TIMEOUT, LaunchAgent, LaunchdError, ServiceStatus
+from .launchd import BOOTOUT_TIMEOUT, LaunchdError, ServiceStatus, service
 from .stats import process_stats
 
 if TYPE_CHECKING:
@@ -156,11 +158,11 @@ def _settle_copies(root: Path, target: Path) -> set[Path]:
 
 
 class AgentService:
-    """An app run as a LaunchAgent in the user's session."""
+    """An app run as the Supervisor's user, in the current launchd layout."""
 
     def __init__(self, label: str) -> None:
         """Initialize."""
-        self.agent = LaunchAgent(label)
+        self.agent = service(label)
         self.label = label
 
     async def status(self) -> ServiceStatus:
@@ -176,7 +178,7 @@ class AgentService:
         log_file: Path,
         run_at_load: bool,
     ) -> None:
-        """Write the LaunchAgent."""
+        """Write the service definition."""
         script = version_path / "app" / info.run
         program = (
             [str(version_path / "venv" / "bin" / "python"), str(script)]

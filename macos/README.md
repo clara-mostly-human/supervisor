@@ -33,6 +33,17 @@ Running in production on a Mac mini since 2026-10-18:
 - **Command line:** the `ha` command.
 - **Appliance basics:** the Mac doesn't go to sleep while the Supervisor runs.
 
+Built and unit-tested, not yet tried on a real install:
+
+- **Running with nobody logged in (the system layout).** With a Bluetooth
+  dongle instead of the Mac's own radio, the Supervisor, Core and apps can
+  run as LaunchDaemons that run as the user, so a logout doesn't stop them.
+  - Switch with `python -m supervisor.native.layout system` (back with
+    `session`). It needs the root helper version 2.
+  - Their plists hold no tokens (a plist and `launchctl print` show a job's
+    environment to every account). `/bin/sh` reads the environment from a
+    file only the user can read.
+
 ## What makes it an OS (the plan)
 
 Each step lands in this branch with tests, and production moves to it in a
@@ -105,6 +116,17 @@ Assistant OS, so those stay off.
     - Not built or tested yet.
   - Still untested: whether the service starts before anyone logs in (needs
     a reboot).
+- **The root helper's trust model.** The Supervisor runs as the logged-in
+  user, and the root helper installs and runs privileged apps (the Thread
+  border router) that this account chooses. So any process running as the
+  user can run code as root through the helper's socket, without a password.
+  That includes unprivileged apps, also from third-party repositories.
+  - Version 2 closes the other ways a review found: `copy` through links,
+    and a root app's environment (`BASH_ENV`, `SHELLOPTS`).
+  - Not yet closed: root apps write logs and data into folders the user
+    owns, and their plists show their app token to every account.
+  - Options: accept it; take root apps only from the official apps
+    repository at a pinned commit; or ask for approval per install.
 - **Signing.** A self-signed (ad-hoc) app can register a system service. The
   user approves it once under System Settings › General › Login Items &
   Extensions › App Background Activity, and it then runs. For other people to
