@@ -1,0 +1,5 @@
+{
+  "zigbee-ble": {"version": null, "url": null, "sha256": null},
+  "thread-rcp": {"version": null, "url": null, "sha256": null},
+  "thread-ble": {"version": null, "url": null, "sha256": null}
+}

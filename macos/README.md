@@ -11,6 +11,26 @@ runs as a native process, runs Home Assistant Core from a Python virtual
 environment, runs apps as launchd services, and has a small root helper where
 macOS needs root.
 
+## Install
+
+On a Mac with Apple silicon and macOS 15 or later, with Homebrew:
+
+    git clone -b macos_support-2026.11 https://github.com/clara-mostly-human/supervisor
+    supervisor/macos/install/install.sh --dry-run   # the plan, nothing changed
+    supervisor/macos/install/install.sh
+
+The installer (`install/install.py`) checks the Mac, finds radio dongles and asks
+what each SONOFF Dongle Plus MG24 should run (`install/firmware.json` lists the
+images it can flash), flashes it safely, sets up the Supervisor, the root helper
+and the apps, and opens onboarding. Bluetooth decides where Home Assistant runs:
+- **With a dongle that carries Bluetooth** (Zigbee + Bluetooth, later Thread +
+  Bluetooth), the Supervisor, Core and apps run as system services and need
+  nobody logged in. The Mac's own radio can join as a listen-only extra source
+  while someone is logged in (macscan).
+- **Without one**, Home Assistant uses the Mac's own Bluetooth, which macOS gives
+  only to a logged-in session. It then runs as a login item and stops at logout;
+  the installer says so before it goes ahead.
+
 ## What works today
 
 Running in production on a Mac mini since 2026-10-18:
@@ -123,10 +143,14 @@ Assistant OS, so those stay off.
   That includes unprivileged apps, also from third-party repositories.
   - Version 2 closes the other ways a review found: `copy` through links,
     and a root app's environment (`BASH_ENV`, `SHELLOPTS`).
-  - Not yet closed: root apps write logs and data into folders the user
-    owns, and their plists show their app token to every account.
-  - Options: accept it; take root apps only from the official apps
-    repository at a pinned commit; or ask for approval per install.
+  - Version 3 keeps root apps' tokens out of their plists: they go into a
+    file only root can read.
+  - Decided (2026-11-17): accept it. This is parity with Home Assistant OS,
+    where the Supervisor controls Docker and a privileged add-on gets root.
+    Pinning the apps repository doesn't pin binaries built on the Mac, and a
+    per-install password needs a GUI the system layout doesn't have. Revisit
+    when the helper is a signed SMAppService daemon that can check its
+    caller's signature.
 - **Signing.** A self-signed (ad-hoc) app can register a system service. The
   user approves it once under System Settings › General › Login Items &
   Extensions › App Background Activity, and it then runs. For other people to
@@ -143,5 +167,6 @@ Assistant OS, so those stay off.
   - hardware, network and host information;
   - logs and stats.
 - `macos/helper/`: the root helper, installed once with `sudo`.
+- `macos/install/`: the installer and the firmware images it can flash.
 - `macos/core-patches/`: patches applied to every Core install.
 - `tests/native/`: tests for the macOS backends.
