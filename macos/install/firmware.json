@@ -1,5 +1,13 @@
 {
-  "zigbee-ble": {"version": null, "url": null, "sha256": null},
-  "thread-rcp": {"version": null, "url": null, "sha256": null},
+  "zigbee-ble": {
+    "version": "2026.11.17",
+    "url": "https://github.com/clara-mostly-human/thread-rcp-firmware/releases/download/v2026.11.17/zigbee-ble-hci-pmg24-2026.11.17-460800.gbl",
+    "sha256": "3035da62ad776b7e795f1e01462c50cf3b1506c852012048ee1c965ea59a8ad5"
+  },
+  "thread-rcp": {
+    "version": "2.7.3.0",
+    "url": "https://github.com/clara-mostly-human/thread-rcp-firmware/releases/download/v2026.11.17/ot-rcp-pmg24-2.7.3.0-460800.gbl",
+    "sha256": "036fcdea57baa76c241114068adce99aab019d50947e15d898cebad561e15c39"
+  },
   "thread-ble": {"version": null, "url": null, "sha256": null}
 }
