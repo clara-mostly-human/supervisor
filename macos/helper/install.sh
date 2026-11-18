@@ -38,6 +38,15 @@ PLIST
 chown root:wheel "$PLIST"; chmod 644 "$PLIST"
 
 launchctl bootout system/ha-macos.helper 2>/dev/null || true
+# bootout returns before launchd has finished removing the job; loading it
+# again before then fails with "Bootstrap failed: 5: Input/output error".
+for _ in $(seq 40); do
+  launchctl print system/ha-macos.helper >/dev/null 2>&1 || break
+  sleep 0.25
+done
+# The old helper's socket file stays behind: remove it, or the wait below
+# would see it and report success for a helper that never started.
+rm -f "$SOCK"
 launchctl bootstrap system "$PLIST"
 for _ in $(seq 20); do [ -S "$SOCK" ] && break; sleep 0.5; done
 [ -S "$SOCK" ] || { echo "helper did not start; see /var/log/ha-macos-helper.log" >&2; exit 1; }
