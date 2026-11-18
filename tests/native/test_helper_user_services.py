@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import plistlib
 import stat
+import subprocess
 import sys
 from types import ModuleType
 from typing import Any
@@ -117,9 +118,9 @@ def _actions(helper: Any) -> list[tuple[str, ...]]:
     return [call for call in helper.launchd.calls if call[0] != "print"]
 
 
-def test_ping_reports_version_2(helper: Any) -> None:
-    """Version 2 has the user services."""
-    assert helper.handle({"command": "ping"})["version"] == 2
+def test_ping_reports_version_3(helper: Any) -> None:
+    """Version 2 has the user services; 3 keeps root apps' tokens out of plists."""
+    assert helper.handle({"command": "ping"})["version"] == 3
 
 
 def test_user_service_keeps_secrets_out_of_the_plist(helper: Any) -> None:
@@ -352,43 +353,223 @@ def _installed_app(helper: Any) -> None:
     run.chmod(0o755)
 
 
-def test_root_service_gets_only_the_supervisors_variables(helper: Any) -> None:
-    """Never pass variables a root shell acts on (BASH_ENV, SHELLOPTS, DYLD_*)."""
-    _installed_app(helper)
-    passed = {
-        "SUPERVISOR": "127.0.0.1:4358",
-        "HASSIO": "127.0.0.1:4358",
-        "SUPERVISOR_TOKEN": "t",
-        "HASSIO_TOKEN": "t",
-        "TZ": "UTC",
-        "APP_DATA": _home(helper, "data"),
-        "PORT_8081_TCP": "8081",
-    }
-    helper.handle(
+SUPERVISOR_VARIABLES = {
+    "SUPERVISOR": "127.0.0.1:4358",
+    "HASSIO": "127.0.0.1:4358",
+    "SUPERVISOR_TOKEN": "secret-token",
+    "HASSIO_TOKEN": "secret-token",
+    "TZ": "UTC",
+    "APP_DATA": "/x/data",
+    "PORT_8081_TCP": "8081",
+}
+
+
+def _root_service(helper: Any, env: dict[str, str]) -> dict[str, Any]:
+    return helper.handle(
         {
             "command": "service",
             "prefix": "ha-macos",
             "slug": "otbr",
             "version": "1",
             "program": "app/run.sh",
-            "env": passed
-            | {
-                "HOME": helper.home,
-                "PATH": "/evil:/usr/bin",
-                "BASH_ENV": _home(helper, "x.sh"),
-                "ENV": _home(helper, "x.sh"),
-                "SHELLOPTS": "xtrace",
-                "PS4": "$(id)",
-                "DYLD_INSERT_LIBRARIES": _home(helper, "x.dylib"),
-            },
+            "args": ["--flag"],
+            "env": env,
             "working_directory": helper.home,
             "log_file": _home(helper, "logs", "otbr.log"),
             "run_at_load": True,
         }
     )
-    env = _plist(helper, "ha-macos.app.otbr")["EnvironmentVariables"]
+
+
+SHELLS = [sh for sh in ("/bin/sh", "/bin/bash", "/bin/dash") if Path(sh).exists()]
+
+
+def _source(env_file: Path) -> dict[str, str]:
+    """Return what sh exports after sourcing env_file, as the root wrapper does.
+
+    sh starts with an empty environment and adds only PWD and SHLVL itself, so
+    anything else (PATH among it) came from the file.
+    """
+    script = 'set -a; . "$1"; set +a; exec /usr/bin/env -0'
+    out = subprocess.run(
+        ["/bin/sh", "-c", script, "sh", str(env_file)],
+        env={},
+        capture_output=True,
+        check=True,
+    ).stdout.decode()
+    variables = dict(item.split("=", 1) for item in out.split("\0") if item)
+    for own in ("PWD", "SHLVL", "_"):
+        variables.pop(own, None)
+    return variables
+
+
+def test_root_service_keeps_secrets_out_of_the_plist(helper: Any) -> None:
+    """The plist runs sh, which sources a root-only file; it holds no token."""
+    _installed_app(helper)
+    assert _root_service(helper, SUPERVISOR_VARIABLES) == {"label": "ha-macos.app.otbr"}
+    label = "ha-macos.app.otbr"
+    plist = Path(helper.daemons, f"{label}.plist")
+    data = _plist(helper, label)
     root = os.path.realpath(Path(helper.base, "apps", "ha-macos", "otbr", "1"))
-    assert env == passed | {"PATH": helper_module.SYSTEM_PATH, "HOME": root}
+    env_file = Path(helper.base, "env", f"{label}.env")
+    assert data["ProgramArguments"] == [
+        "/bin/sh",
+        "-c",
+        helper_module.ROOT_WRAPPER,
+        label,
+        str(env_file),
+        str(Path(root, "app", "run.sh")),
+        "--flag",
+    ]
+    assert data["EnvironmentVariables"] == {
+        "PATH": helper_module.SYSTEM_PATH,
+        "HOME": root,
+    }
+    assert "UserName" not in data
+    assert data["StandardOutPath"] == _home(helper, "logs", "otbr.log")
+    assert b"secret-token" not in plist.read_bytes()
+    assert env_file.stat().st_mode & 0o777 == 0o600
+    assert env_file.parent.stat().st_mode & 0o777 == 0o700
+    assert _source(env_file) == SUPERVISOR_VARIABLES
+
+
+def test_root_service_gets_only_the_supervisors_variables(helper: Any) -> None:
+    """Never pass variables a root shell acts on (BASH_ENV, SHELLOPTS, DYLD_*)."""
+    _installed_app(helper)
+    _root_service(
+        helper,
+        SUPERVISOR_VARIABLES
+        | {
+            "HOME": helper.home,
+            "PATH": "/evil:/usr/bin",
+            "BASH_ENV": _home(helper, "x.sh"),
+            "ENV": _home(helper, "x.sh"),
+            "SHELLOPTS": "xtrace",
+            "PS4": "$(id)",
+            "DYLD_INSERT_LIBRARIES": _home(helper, "x.dylib"),
+        },
+    )
+    env_file = Path(helper.base, "env", "ha-macos.app.otbr.env")
+    assert _source(env_file) == SUPERVISOR_VARIABLES
+    names = [line.split("=", 1)[0] for line in env_file.read_text().splitlines()]
+    assert names == sorted(SUPERVISOR_VARIABLES)
+    root = os.path.realpath(Path(helper.base, "apps", "ha-macos", "otbr", "1"))
+    assert _plist(helper, "ha-macos.app.otbr")["EnvironmentVariables"] == {
+        "PATH": helper_module.SYSTEM_PATH,
+        "HOME": root,
+    }
+
+
+def test_root_env_values_are_data_never_code(helper: Any, tmp_path: Path) -> None:
+    """A value with quotes, $(...), backticks or a newline reaches the app as is."""
+    _installed_app(helper)
+    marker = tmp_path / "ran"
+    tricky = {
+        "APP_A": f"$(touch {marker})",
+        "APP_B": f"`touch {marker}`",
+        "APP_C": 'it\'s "quoted"\nsecond line',
+        "APP_D": f"x'; touch {marker}; '",
+        "TZ": "",
+    }
+    _root_service(helper, tricky)
+    assert _source(Path(helper.base, "env", "ha-macos.app.otbr.env")) == tricky
+    assert not marker.exists()
+
+
+def test_the_root_wrapper_runs_the_program_with_the_env_file(tmp_path: Path) -> None:
+    """Run the root wrapper for real: the program gets the file's variables."""
+    env_file = tmp_path / "x.env"
+    env_file.write_text("SUPERVISOR_TOKEN='a b'\n")
+    out = tmp_path / "out"
+    script = (
+        "import os, sys; "
+        "open(sys.argv[1], 'w').write(os.environ['SUPERVISOR_TOKEN'] + sys.argv[2])"
+    )
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - child
+        os.execv(  # noqa: S606
+            "/bin/sh",
+            ["/bin/sh", "-c", helper_module.ROOT_WRAPPER, "label", str(env_file)]
+            + [sys.executable, "-c", script, str(out), "!"],
+        )
+    _, status = os.waitpid(pid, 0)
+    assert os.WEXITSTATUS(status) == 0
+    assert out.read_text() == "a b!"
+
+
+@pytest.mark.parametrize(
+    ("env", "args"),
+    [
+        ({"APP_X": "a\0b"}, []),
+        ({"APP_X": 1}, []),
+        ({"bad-key": "x"}, []),
+        ({}, ["a\0b"]),
+        ({}, [1]),
+    ],
+)
+def test_root_service_refuses_bad_input(
+    helper: Any, env: dict[str, Any], args: list[Any]
+) -> None:
+    """Refuse what sh or launchd can't carry, and write nothing."""
+    _installed_app(helper)
+    with pytest.raises(helper_module.Refused):
+        helper.handle(
+            {
+                "command": "service",
+                "prefix": "ha-macos",
+                "slug": "otbr",
+                "version": "1",
+                "program": "app/run.sh",
+                "args": args,
+                "env": env,
+                "working_directory": helper.home,
+                "log_file": _home(helper, "logs", "otbr.log"),
+            }
+        )
+    assert not Path(helper.daemons, "ha-macos.app.otbr.plist").exists()
+    assert not Path(helper.base, "env", "ha-macos.app.otbr.env").exists()
+
+
+def test_root_env_folder_must_be_a_real_folder(helper: Any, tmp_path: Path) -> None:
+    """A link in place of base/env is refused, not followed."""
+    _installed_app(helper)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    Path(helper.base, "env").symlink_to(elsewhere)
+    with pytest.raises(helper_module.Refused, match="not a folder"):
+        _root_service(helper, SUPERVISOR_VARIABLES)
+    assert not list(elsewhere.iterdir())
+
+
+def test_root_env_folder_must_be_roots(helper: Any) -> None:
+    """In production a folder root doesn't own is refused (tests run as a user)."""
+    _installed_app(helper)
+    helper.chown = True
+    with pytest.raises(helper_module.Refused, match="not root's"):
+        _root_service(helper, SUPERVISOR_VARIABLES)
+    assert not list(Path(helper.base, "env").iterdir())
+    assert not Path(helper.daemons, "ha-macos.app.otbr.plist").exists()
+
+
+def test_root_env_folder_is_made_private(helper: Any) -> None:
+    """An existing env folder others could open is closed to them."""
+    _installed_app(helper)
+    folder = Path(helper.base, "env")
+    folder.mkdir(parents=True)
+    folder.chmod(0o755)
+    _root_service(helper, SUPERVISOR_VARIABLES)
+    assert folder.stat().st_mode & 0o777 == 0o700
+
+
+def test_unservice_removes_the_env_file(helper: Any) -> None:
+    """Removing a root service leaves no token behind."""
+    _installed_app(helper)
+    _root_service(helper, SUPERVISOR_VARIABLES)
+    env_file = Path(helper.base, "env", "ha-macos.app.otbr.env")
+    assert env_file.exists()
+    helper.handle({"command": "unservice", "prefix": "ha-macos", "slug": "otbr"})
+    assert not env_file.exists()
+    assert not Path(helper.daemons, "ha-macos.app.otbr.plist").exists()
 
 
 # copy: root reads what the user can't (OTBR's data) and writes into the home
@@ -512,19 +693,36 @@ def test_copy_does_not_hang_on_a_fifo(helper: Any) -> None:
         _copy(helper, source, dest)
 
 
-def test_the_wrapper_reports_a_missing_env_file(tmp_path: Path) -> None:
-    """Make a failing wrapper exit non-zero and leave its reason in the log."""
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_wrapper_reports_a_missing_env_file(tmp_path: Path, shell: str) -> None:
+    """A user service without its env file exits 78 and says why in the log."""
     out, err = tmp_path / "out", tmp_path / "err"
     pid = os.fork()
     if pid == 0:  # pragma: no cover - child
         os.execv(  # noqa: S606
-            "/bin/sh",
-            ["/bin/sh", "-c", helper_module.USER_WRAPPER, "label"]
+            shell,
+            [shell, "-c", helper_module.USER_WRAPPER, "label"]
             + [str(tmp_path / "missing.env"), str(out), str(err), "/usr/bin/true"],
         )
     _, status = os.waitpid(pid, 0)
-    assert os.WEXITSTATUS(status) != 0
-    assert "missing.env" in err.read_text()
+    assert os.WEXITSTATUS(status) == 78
+    assert err.read_text() == f"label: cannot read {tmp_path / 'missing.env'}\n"
+
+
+@pytest.mark.parametrize("shell", SHELLS)
+def test_the_root_wrapper_reports_a_missing_env_file(
+    tmp_path: Path, shell: str
+) -> None:
+    """A root service without its env file exits 78 and says why on stderr."""
+    result = subprocess.run(
+        [shell, "-c", helper_module.ROOT_WRAPPER, "label"]
+        + [str(tmp_path / "missing.env"), "/usr/bin/true"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 78
+    assert result.stderr == f"label: cannot read {tmp_path / 'missing.env'}\n"
 
 
 def test_user_service_refuses_a_label_a_root_job_holds(helper: Any) -> None:

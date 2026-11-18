@@ -66,6 +66,8 @@ _LOGGER: logging.Logger = logging.getLogger(__name__)
 
 INSTALLED_MARKER = ".installed"
 STOP_TIMEOUT = 60
+# The root helper version that keeps root apps' tokens out of their plists.
+HELPER_ROOT_ENV_FILE = 3
 POLL_SECONDS = 5
 LOG_TAIL_LINES = 1000
 HOST_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -238,6 +240,16 @@ class DaemonService:
         run_at_load: bool,
     ) -> None:
         """Have the helper write the LaunchDaemon."""
+        version = (await helper.call("ping")).get("version", 1)
+        if version < HELPER_ROOT_ENV_FILE:
+            _LOGGER.warning(
+                "The root helper is version %s: %s's API token goes into its "
+                "plist, which every account on this Mac can read. Install "
+                "version %s: sudo macos/helper/install.sh",
+                version,
+                self.label,
+                HELPER_ROOT_ENV_FILE,
+            )
         await helper.call(
             "service",
             **self.params,

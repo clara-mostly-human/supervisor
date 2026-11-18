@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, call, patch
 import pytest
 
 from supervisor.native import helper, launchd
-from supervisor.native.app import AgentService
+from supervisor.native.app import AgentService, DaemonService
 from supervisor.native.launchd import (
     LaunchAgent,
     LaunchdError,
@@ -336,3 +336,22 @@ def test_call_sync_without_helper(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(helper, "SOCKET", "/tmp/no-such-helper-socket")  # noqa: S108
     with pytest.raises(helper.HelperError, match="not reachable"):
         helper.call_sync("ping")
+
+
+@pytest.mark.parametrize(("version", "warned"), [(2, True), (3, False)])
+async def test_root_app_warns_about_an_old_helper(
+    caplog: pytest.LogCaptureFixture, version: int, warned: bool
+):
+    """Test an old helper is named: it puts a root app's token in its plist."""
+    replies = {"ping": {"version": version}, "service": {"label": "x"}}
+
+    async def fake_call(command: str, **_: Any) -> dict[str, Any]:
+        return replies[command]
+
+    daemon = DaemonService("ha-macos", "otbr", "1")
+    info = MagicMock(run="run.sh")
+    with patch.object(helper, "call", fake_call):
+        await daemon.define(
+            Path("/v"), info, {}, Path("/d"), Path("/l"), run_at_load=True
+        )
+    assert ("is version 2" in caplog.text) is warned

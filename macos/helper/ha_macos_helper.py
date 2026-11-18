@@ -13,6 +13,9 @@ What it does, and nothing else:
   afterwards. Symlinks are copied as files.
 * service / start / stop / status / unservice: manage the LaunchDaemon
   "<prefix>.app.<slug>", whose program must be inside that root-owned folder.
+  Its environment (the app's API token) goes into a file only root can read,
+  <base>/env/<label>.env, which /bin/sh sources before running the program:
+  a plist, and launchctl print, show the environment to every account.
 * copy: copy files root may read but the user may not (an app's data, e.g.
   OTBR's Thread credentials) between folders in the user's home.
 * user_service / user_bootstrap / user_kickstart / user_bootout /
@@ -39,6 +42,7 @@ import json
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -47,7 +51,7 @@ import subprocess
 import sys
 import time
 
-VERSION = 2
+VERSION = 3
 RE_SLUG = re.compile(r"^[a-z0-9_]{1,64}$")
 RE_VERSION = re.compile(r"^[A-Za-z0-9._+-]{1,64}$")
 RE_PREFIX = re.compile(r"^ha-macos(-[a-z0-9]{1,16})?$")
@@ -59,11 +63,18 @@ SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 ROOT_ENV_KEYS = ("SUPERVISOR", "HASSIO", "SUPERVISOR_TOKEN", "HASSIO_TOKEN", "TZ")
 ROOT_ENV_PREFIXES = ("APP_", "PORT_")
 # A user service's program: sh, as the user, sources the environment file and
-# runs the program with its output appended to the logs.
-USER_WRAPPER = (
-    'out=$2; err=$3; exec >>"$out" 2>>"$err"; '
-    'set -a; . "$1" || exit 78; set +a; shift 3; exec "$@"'
+# runs the program with its output appended to the logs. A POSIX sh exits as
+# soon as "." fails, so the file is checked first: exit 78 (EX_CONFIG) says so.
+_SOURCE_ENV = (
+    '[ -r "$1" ] || { echo "$0: cannot read $1" >&2; exit 78; }; '
+    'set -a; . "$1"; set +a; '
 )
+USER_WRAPPER = (
+    'out=$2; err=$3; exec >>"$out" 2>>"$err"; ' + _SOURCE_ENV + 'shift 3; exec "$@"'
+)
+# A root service's program: sh, as root, sources the root-only environment file
+# the helper wrote and runs the program (launchd opens the log).
+ROOT_WRAPPER = _SOURCE_ENV + 'shift; exec "$@"'
 
 
 class Refused(Exception):
@@ -191,24 +202,32 @@ class Helper:
             raise Refused("program must be an executable inside the installed app")
         env = {}
         for key, value in (req.get("env") or {}).items():
-            if not RE_ENV_KEY.fullmatch(key) or not isinstance(value, str):
+            if (
+                not RE_ENV_KEY.fullmatch(key)
+                or not isinstance(value, str)
+                or "\0" in value
+            ):
                 raise Refused("bad environment")
             # Never let the user account choose what root loads or runs: only
             # the Supervisor's own variables pass (no DYLD_*, BASH_ENV, ...).
             if key in ROOT_ENV_KEYS or key.startswith(ROOT_ENV_PREFIXES):
                 env[key] = value
-        env["PATH"] = SYSTEM_PATH
-        env["HOME"] = root
         args = req.get("args") or []
-        if not all(isinstance(arg, str) for arg in args):
+        if not all(isinstance(arg, str) and "\0" not in arg for arg in args):
             raise Refused("bad arguments")
         workdir = self._inside_home(req["working_directory"])
         log = self._inside_home(req["log_file"])
         label = self._label(prefix, slug)
+        # The variables (API tokens among them) go into a file only root can
+        # read: a plist, and launchctl print, show its environment to every
+        # account. The plist keeps only PATH and HOME.
+        env_file = self._write_root_env(label, env)
         data = {
             "Label": label,
-            "ProgramArguments": [program] + args,
-            "EnvironmentVariables": env,
+            "ProgramArguments": ["/bin/sh", "-c", ROOT_WRAPPER, label, env_file]
+            + [program]
+            + args,
+            "EnvironmentVariables": {"PATH": SYSTEM_PATH, "HOME": root},
             "WorkingDirectory": workdir,
             "StandardOutPath": log,
             "StandardErrorPath": log,
@@ -255,10 +274,48 @@ class Helper:
 
     def cmd_unservice(self, req):
         self.cmd_stop(req)
-        path = self._plist(self._label(req["prefix"], req["slug"]))
+        label = self._label(req["prefix"], req["slug"])
+        path = self._plist(label)
         if os.path.exists(path):
             os.remove(path)
+        env_file = self._root_env_file(label)
+        if os.path.lexists(env_file):
+            os.remove(env_file)
         return {}
+
+    # Root services' environment files
+
+    def _root_env_dir(self):
+        """Return base/env, a folder only root can open (refuse anything else)."""
+        path = os.path.join(self.base, "env")
+        os.makedirs(path, mode=0o700, exist_ok=True)
+        info = os.lstat(path)
+        if not stat.S_ISDIR(info.st_mode):
+            raise Refused("%s is not a folder" % path)
+        if self.chown and info.st_uid != 0:
+            raise Refused("%s is not root's" % path)
+        if info.st_mode & 0o077:
+            os.chmod(path, 0o700)
+        return path
+
+    def _root_env_file(self, label):
+        return os.path.join(self.base, "env", label + ".env")
+
+    def _write_root_env(self, label, env):
+        """Write env as sh assignments, readable by root only; return the path."""
+        path = os.path.join(self._root_env_dir(), label + ".env")
+        tmp = path + ".tmp"
+        if os.path.lexists(tmp):
+            os.remove(tmp)
+        text = "".join(
+            "%s=%s\n" % (key, shlex.quote(value)) for key, value in sorted(env.items())
+        )
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as file:
+            file.write(text)
+        os.chmod(tmp, 0o600)
+        os.rename(tmp, path)
+        return path
 
     # User services
 
