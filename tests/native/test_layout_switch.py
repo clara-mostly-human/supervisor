@@ -41,6 +41,7 @@ class World:
         self.system: dict[str, str | None] = {OTBR: None}  # label -> user
         self.helper_version = 2
         self.fail: str | None = None
+        self.app_start_fails: set[str] = set()
         self.supervisor = {
             "Label": "ha-macos.supervisor",
             "ProgramArguments": ["/x/supervisor/bin/python", "-m", "supervisor"],
@@ -143,10 +144,28 @@ class World:
             path.unlink(missing_ok=True)
         return {}
 
+    # Supervisor API
+
+    def api(self, port: str, token: str, method: str, path: str) -> dict:
+        """Answer like the new Supervisor: running; app starts per app_start_fails."""
+        assert token == "cli-token"
+        self.log.append(("api", method, path))
+        if path == "info":
+            return {"result": "ok", "data": {"state": "running"}}
+        slug = path.split("/")[1]
+        if slug in self.app_start_fails:
+            return {"result": "error", "message": "no luck"}
+        return {"result": "ok", "data": {}}
+
     # layouts
+
+    def _cli_token(self) -> None:
+        self.data.mkdir(parents=True, exist_ok=True)
+        (self.data / "cli.json").write_text('{"access_token": "cli-token"}')
 
     def session(self) -> None:
         """Lay out a running session install: Supervisor, Core and two apps."""
+        self._cli_token()
         _write(self.agents / "ha-macos.supervisor.plist", self.supervisor)
         for label in ("ha-macos.core", "ha-macos.app.b", "ha-macos.app.a"):
             _write(self.agents / f"{label}.plist", {"Label": label})
@@ -163,6 +182,7 @@ class World:
 
     def system_layout(self) -> None:
         """Lay out a running system install (as the system Supervisor made it)."""
+        self._cli_token()
         env_file = self.data / "launchd" / "ha-macos.supervisor.env"
         launchd.write_env_file(
             env_file,
@@ -221,6 +241,7 @@ def fixture_world(tmp_path: Path) -> Iterator[World]:
         patch.object(LaunchAgent, "bootout", bootout),
         patch.object(layout, "_wait_api", AsyncMock()),
         patch.object(layout, "_stash_dir", lambda prefix: world.stash),
+        patch.object(layout, "_api", side_effect=world.api),
     ):
         yield world
 
@@ -245,6 +266,11 @@ async def test_to_system_stops_in_order_and_starts_the_supervisor_daemon(world: 
         ("stop", "LaunchAgent", "ha-macos.app.c", layout.APP_STOP_TIMEOUT),
         ("helper", "user_service", "supervisor"),
         ("helper", "user_bootstrap", "supervisor"),
+        # A restart, not a boot, for the new Supervisor: it starts no apps.
+        ("api", "GET", "info"),
+        ("api", "POST", "addons/a/start"),
+        ("api", "POST", "addons/b/start"),
+        ("api", "POST", "addons/c/start"),
     ]
     request = world.service_request
     assert request["keep_alive"] is True
@@ -389,6 +415,9 @@ async def test_to_session_leaves_root_daemons_alone(world: World):
             GUI,
             str(world.agents / "ha-macos.supervisor.plist"),
         ),
+        ("api", "GET", "info"),
+        ("api", "POST", "addons/a/start"),
+        ("api", "POST", "addons/d/start"),
     ]
     assert OTBR in world.system
     assert await asyncio.to_thread((world.daemons / f"{OTBR}.plist").exists)
@@ -520,3 +549,25 @@ def test_service_labels_reads_only_the_services_block():
         "ha-macos.app.b",
         "ha-macos.app.c",
     }
+
+
+async def test_only_apps_that_ran_are_started_again(world: World):
+    """Test an app that was stopped before the switch stays stopped."""
+    await asyncio.to_thread(world.session)
+    assert world.gui is not None
+    world.gui.discard("ha-macos.app.b")  # defined, but stopped by the user
+    await layout.to_system(**_args(world))
+    starts = [entry[2] for entry in world.log if entry[:2] == ("api", "POST")]
+    assert starts == ["addons/a/start", "addons/c/start"]
+
+
+async def test_an_app_that_fails_to_start_is_reported_not_rolled_back(world: World):
+    """Test the switch stands; the app that didn't start is named."""
+    await asyncio.to_thread(world.session)
+    world.app_start_fails = {"b"}
+    with pytest.raises(layout.LayoutError, match="didn't start: b"):
+        await layout.to_system(**_args(world))
+    assert world.system["ha-macos.supervisor"] == USER
+    assert await asyncio.to_thread(_names, world.agents) == ["ha-macos-dev.core.plist"]
+    starts = [entry[2] for entry in world.log if entry[:2] == ("api", "POST")]
+    assert starts == ["addons/a/start", "addons/b/start", "addons/c/start"]

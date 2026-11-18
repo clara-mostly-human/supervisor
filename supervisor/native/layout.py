@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 from pathlib import Path
 import plistlib
@@ -184,11 +185,68 @@ async def _unload_keepalive(svc: LaunchAgent) -> None:
         await asyncio.sleep(0.5)
 
 
-async def _stop_children(labels: list[str], make: type[LaunchAgent]) -> None:
+async def _stop_children(labels: list[str], make: type[LaunchAgent]) -> list[str]:
+    """Stop Core and apps; return the apps that were running."""
+    running = []
     for label in labels:
+        svc = make(label)
+        if ".app." in label and (await svc.status()).running:
+            running.append(label)
         timeout = STOP_TIMEOUT if label.endswith(".core") else APP_STOP_TIMEOUT
         _say(f"stopping {label}")
-        await make(label).bootout(timeout)
+        await svc.bootout(timeout)
+    return running
+
+
+def _api(port: str, token: str, method: str, path: str) -> dict:
+    """Call the Supervisor API (blocking) and return its JSON answer."""
+    host = "127.0.0.1" if port == "80" else f"127.0.0.1:{port}"
+    request = urllib.request.Request(  # noqa: S310
+        f"http://{host}/{path}",
+        method=method,
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as reply:  # noqa: S310
+            return json.loads(reply.read() or b"{}")
+    except urllib.error.HTTPError as err:
+        return json.loads(err.read() or b"{}")
+
+
+async def _start_apps(supervisor: dict, port: str, labels: list[str]) -> None:
+    """Start the apps that ran before the switch.
+
+    The new Supervisor sees a restart, not a boot (the Mac didn't reboot), and
+    on a restart it only attaches to apps that still run: the ones this
+    switch stopped would stay off until the next reboot.
+    """
+    if not labels:
+        return
+    data = Path(supervisor["EnvironmentVariables"]["SUPERVISOR_DATA"])
+    cli = await asyncio.to_thread(lambda: json.loads((data / "cli.json").read_text()))
+    token = cli["access_token"]
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + API_WAIT
+    while True:
+        info = await asyncio.to_thread(_api, port, token, "GET", "info")
+        if info.get("data", {}).get("state") == "running":
+            break
+        if loop.time() >= deadline:
+            raise LayoutError("the Supervisor did not finish starting")
+        await asyncio.sleep(2)
+    failed = []
+    for label in labels:
+        slug = label.split(".app.", 1)[1]
+        _say(f"starting app {slug}")
+        reply = await asyncio.to_thread(
+            _api, port, token, "POST", f"addons/{slug}/start"
+        )
+        if reply.get("result") != "ok":
+            failed.append(f"{slug} ({reply.get('message', reply)})")
+    if failed:
+        raise LayoutError(
+            f"the layout switched, but these apps didn't start: {', '.join(failed)}"
+        )
 
 
 async def _wait_api(port: str) -> None:
@@ -333,7 +391,7 @@ async def to_system(
         # still be queued there: let it finish, then look again.
         await helper.call("ping")
         children = await _session_children(agents, prefix)
-        await _stop_children(children, LaunchAgent)
+        running = await _stop_children(children, LaunchAgent)
         await asyncio.to_thread(_stash, agents, prefix, _stash_dir(prefix))
         stashed = True
         await asyncio.to_thread(_drop, agents, children)
@@ -359,6 +417,7 @@ async def to_system(
         if isinstance(err, Exception):
             raise LayoutError(f"system layout failed: {err}") from err
         raise
+    await _start_apps(supervisor, port, running)
 
 
 async def to_session(
@@ -400,7 +459,7 @@ async def to_session(
         await _unload_keepalive(supervisor_daemon)
         await helper.call("ping")  # let the helper finish the Supervisor's requests
         children = await _system_children(daemons, prefix, user)
-        await _stop_children(children, UserDaemon)
+        running = await _stop_children(children, UserDaemon)
     except BaseException as err:
         # Nothing removed yet: the system Supervisor starts Core and apps again.
         _say(f"the switch failed ({err!r}); starting the system Supervisor again")
@@ -418,6 +477,7 @@ async def to_session(
     await _wait_api(port)
     if left := await _system_children(daemons, prefix, user):
         raise LayoutError(f"still defined in the system domain: {', '.join(left)}")
+    await _start_apps(daemon, port, running)
 
 
 async def _restore_stash_only(prefix: str, agents: Path) -> None:
